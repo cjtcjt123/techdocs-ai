@@ -61,15 +61,20 @@ jobs:
       # 先打一个【不签名】的 archive，再用手动签名导出 IPA
       - name: Build archive & export signed IPA
         run: |
-          cd "$GITHUB_WORKSPACE"
-          WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" | head -1)
-          SCHEME=$(basename "$(find ios -maxdepth 1 -name "*.xcodeproj" | head -1)" .xcodeproj)
+          cd "$GITHUB_WORKSPACE/ios"
+          WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" | head -1)
+          if [ -z "$WORKSPACE" ]; then echo "ERROR: no .xcworkspace (pod install may have failed)"; ls -la; exit 1; fi
+          # 自动探测 scheme：Expo 会把 CJK 应用名清洗为 ASCII（如 技术资料AI助手 -> AI），不再用 basename 假设
+          SCHEME=$(xcodebuild -list -workspace "$WORKSPACE" 2>/dev/null | awk '/Schemes:/{f=1;next} f&&NF{print $1; exit}')
+          if [ -z "$SCHEME" ]; then echo "ERROR: could not detect scheme"; xcodebuild -list -workspace "$WORKSPACE"; exit 1; fi
+          echo "WORKSPACE=$WORKSPACE  SCHEME=$SCHEME"
           ARCHIVE="$RUNNER_TEMP/build.xcarchive"
           EXPORT="$RUNNER_TEMP/export"
           mkdir -p "$EXPORT"
           xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
             -configuration Release clean archive \
             -archivePath "$ARCHIVE" CODE_SIGNING_ALLOWED=NO
+          cd "$GITHUB_WORKSPACE"
           python3 scripts/make-export-options.py
           xcodebuild -exportArchive -archivePath "$ARCHIVE" \
             -exportPath "$EXPORT" -exportOptionsPlist exportOptions.plist
