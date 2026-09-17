@@ -1,0 +1,82 @@
+name: Build signed iOS IPA
+
+# 触发：推送到 master，或在 Actions 页点 "Run workflow" 手动触发
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+      EXPO_NO_TELEMETRY: "1"
+      # ↓↓↓ 在仓库 Settings → Secrets and variables → Actions → Variables 里配置 ↓↓↓
+      TEAM_ID: ${{ vars.TEAM_ID }}          # 10 位 Apple Developer Team ID
+      BUNDLE_ID: ${{ vars.BUNDLE_ID }}      # com.chenjingtao.techdocsai
+      PROFILE_NAME: ${{ vars.PROFILE_NAME }}# Ad Hoc / Development 描述文件名称（Apple Developer 后台显示的名字）
+      SIGN_METHOD: ${{ vars.SIGN_METHOD || 'ad-hoc' }}  # ad-hoc（默认）或 development
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm install --legacy-peer-deps
+
+      # 生成原生 iOS 工程（不需要任何 Apple 凭证）
+      - name: Generate native iOS project
+        run: npx expo prebuild --platform ios --clean
+
+      # 把签名证书 + 描述文件灌进临时 keychain（凭证来自 Secrets）
+      - name: Import signing certificate & provisioning profile
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode > /tmp/build_certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain-db
+          security set-keychain-settings -lut 21600 build.keychain-db
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain-db
+          security import /tmp/build_certificate.p12 -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k build.keychain-db
+          security list-keychains -d user -s build.keychain-db login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain-db
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/profile.mobileprovision"
+
+      # 先打一个【不签名】的 archive，再用手动签名导出 IPA
+      - name: Build archive & export signed IPA
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" | head -1)
+          SCHEME=$(basename "$(find ios -maxdepth 1 -name "*.xcodeproj" | head -1)" .xcodeproj)
+          ARCHIVE="$RUNNER_TEMP/build.xcarchive"
+          EXPORT="$RUNNER_TEMP/export"
+          mkdir -p "$EXPORT"
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
+            -configuration Release clean archive \
+            -archivePath "$ARCHIVE" CODE_SIGNING_ALLOWED=NO
+          python3 scripts/make-export-options.py
+          xcodebuild -exportArchive -archivePath "$ARCHIVE" \
+            -exportPath "$EXPORT" -exportOptionsPlist exportOptions.plist
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: techdocs-ai-ipa
+          path: ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: error

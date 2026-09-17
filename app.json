@@ -19,7 +19,10 @@
     "web": {
       "bundler": "metro"
     },
-    "plugins": [],
+    "plugins": [
+      "expo-asset",
+      "expo-sqlite"
+    ],
     "extra": {
       "eas": {
         "projectId": "9a87b308-4852-425b-b925-b5196a866107"
