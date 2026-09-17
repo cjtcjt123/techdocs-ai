@@ -14,6 +14,7 @@ const sources: { key: ModelSource; label: string }[] = [
 ];
 const providers: { key: Provider; label: string }[] = [
   { key: 'openai', label: 'OpenAI' },
+  { key: 'deepseek', label: 'DeepSeek' },
   { key: 'claude', label: 'Claude' },
   { key: 'tongyi', label: '通义' },
   { key: 'zhipu', label: '智谱' },

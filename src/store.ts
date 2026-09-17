@@ -1,6 +1,7 @@
 // 全局状态：文档导入 / 检索 / 对话 / 合规检查 / 设置 / 锁屏
 import { create } from 'zustand';
 import * as DocumentPicker from 'expo-document-picker';
+import * as ImagePicker from 'expo-image-picker';
 import { secureGet, secureSet } from './lib/secure';
 import {
   Document, Conversation, Message, ModelConfig, DataStrategy,
@@ -20,6 +21,18 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 
 // 内存中保存当前解锁密码（本地 App，足够 MVP；安全存储由 secure-store 落盘）
 let currentPasscode = '';
+
+// 内部 Message.role 用 'user' | 'ai'，但 OpenAI 兼容接口只认 'assistant'。
+// 必须显式转换：用 `as` 断言只改类型、不改运行时值，会直接把 'ai' 发出去导致 400。
+function toChatHistory(msgs: Message[]): ChatMsg[] {
+  return msgs
+    .filter((m) => (m.role === 'user' || m.role === 'ai') && !(m.role === 'ai' && m.content.startsWith('⚠️')))
+    .map((m) => ({
+      role: (m.role === 'ai' ? 'assistant' : 'user') as 'user' | 'assistant',
+      // 只带附件、没有文字的消息，content 会是空串，接口可能拒收，给个占位
+      content: m.content && m.content.trim() ? m.content : '（见本条附件）',
+    }));
+}
 
 interface State {
   ready: boolean;
@@ -42,6 +55,7 @@ interface State {
   runCompliance: (text: string, attachments?: Attachment[]) => Promise<void>;
   updateSettings: (patch: Partial<AppSettings>) => Promise<void>;
   pickAttachments: () => Promise<Attachment[]>;
+  pickImage: () => Promise<Attachment[]>;
   setPasscode: (code: string) => Promise<void>;
   unlock: (code: string) => boolean;
   lock: () => void;
@@ -143,13 +157,11 @@ export const useStore = create<State>((set, get) => ({
       const sys = `你是「技术资料 AI 助手」，只基于下方【可引用资料】与【本次附件】回答，每条结论尽量标注来源（如"见[来源1]"）。
 若资料中没有明确答案，必须说明"资料未提供"，严禁编造数据或参数。`;
       const fullContext = `${sys}\n\n【可引用资料】\n${ctx}\n\n${attText}`;
-      const history: ChatMsg[] = updated.messages
-        .filter((m) => m.role === 'user' || m.role === 'ai')
-        .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+      const history = toChatHistory(updated.messages);
       const messages: ChatMsg[] = [
         { role: 'system', content: fullContext },
         ...history.slice(0, -1), // 去掉刚加的 user（已放最后）
-        { role: 'user', content: text },
+        { role: 'user', content: text && text.trim() ? text : '（见本次附件）' },
       ];
       const aiText = await chat(get().settings.modelConfig, messages);
       const aiMsg: Message = { id: uid(), role: 'ai', content: aiText, quotes: hitsToQuotes(hits) };
@@ -219,6 +231,26 @@ export const useStore = create<State>((set, get) => ({
       out.push({ name: a.name, uri: a.uri, text, type: a.mimeType || (isImage ? 'image' : 'file') });
     }
     return out;
+  },
+
+  // 从系统相册选照片（🖼️ 按钮）
+  async pickImage() {
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) {
+      throw new Error('未获得相册权限。请到 iPhone「设置 → 隐私与安全性 → 照片」中允许本 App 访问相册。');
+    }
+    const res = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsMultipleSelection: true,
+      selectionLimit: 5,
+      quality: 0.8,
+    });
+    if (res.canceled) return [];
+    return res.assets.map((a) => ({
+      name: a.fileName || `照片_${Date.now()}.jpg`,
+      uri: a.uri,
+      type: a.mimeType || 'image/jpeg',
+    } as Attachment));
   },
 
   async setPasscode(code) {

@@ -21,7 +21,14 @@
     },
     "plugins": [
       "expo-asset",
-      "expo-sqlite"
+      "expo-sqlite",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "允许「技术资料AI助手」访问相册，以便把现场照片或样品图片作为附件随问答一起携带。",
+          "cameraPermission": "允许「技术资料AI助手」使用相机拍摄样品照片作为附件。"
+        }
+      ]
     ],
     "extra": {
       "eas": {

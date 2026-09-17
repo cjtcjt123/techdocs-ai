@@ -14,6 +14,13 @@ interface Resolved {
   claude?: boolean;
 }
 
+// 拼接 baseURL + 路径，自动去掉 baseURL 结尾多余的斜杠（避免 /v1//chat/completions 这类双斜杠 404）
+function joinPath(base: string, path: string): string {
+  const b = (base || '').replace(/\/+$/, '');
+  const p = path.startsWith('/') ? path : '/' + path;
+  return b + p;
+}
+
 // 把 ModelConfig 解析成具体请求目标
 export function resolveTarget(cfg: ModelConfig): Resolved {
   if (cfg.source === 'nas') {
@@ -31,6 +38,9 @@ export function resolveTarget(cfg: ModelConfig): Resolved {
         return { baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1', apiKey: cfg.apiKey || '', model: cfg.model || 'qwen-plus' };
       case 'zhipu':
         return { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: cfg.apiKey || '', model: cfg.model || 'glm-4-flash' };
+      case 'deepseek':
+        // 注意：DeepSeek 的接口地址【不带 /v1】，直接 https://api.deepseek.com/chat/completions
+        return { baseURL: 'https://api.deepseek.com', apiKey: cfg.apiKey || '', model: cfg.model || 'deepseek-chat' };
       case 'claude':
         return { baseURL: 'https://api.anthropic.com/v1', apiKey: cfg.apiKey || '', model: cfg.model || 'claude-3-5-haiku-latest', claude: true };
       case 'custom':
@@ -52,14 +62,15 @@ export async function chat(cfg: ModelConfig, messages: ChatMsg[]): Promise<strin
   }
   if (t.claude) return chatClaude(t, messages);
 
-  const res = await fetch(`${t.baseURL}/chat/completions`, {
+  const url = joinPath(t.baseURL, '/chat/completions');
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t.apiKey}` },
     body: JSON.stringify({ model: t.model, messages, stream: false, temperature: 0.2 }),
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`API 错误 ${res.status}：${txt.slice(0, 200)}`);
+    throw new Error(`API 错误 ${res.status} @ ${url}：${txt.slice(0, 300)}`);
   }
   const data = await res.json();
   const content = data?.choices?.[0]?.message?.content;
@@ -72,14 +83,15 @@ async function chatClaude(t: Resolved, messages: ChatMsg[]): Promise<string> {
   const msgs = messages
     .filter((m) => m.role !== 'system')
     .map((m) => ({ role: m.role, content: m.content }));
-  const res = await fetch(`${t.baseURL}/messages`, {
+  const url = joinPath(t.baseURL, '/messages');
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': t.apiKey, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({ model: t.model, system, messages: msgs, max_tokens: 2000 }),
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`Claude 错误 ${res.status}：${txt.slice(0, 200)}`);
+    throw new Error(`Claude 错误 ${res.status} @ ${url}：${txt.slice(0, 200)}`);
   }
   const data = await res.json();
   return (data?.content || []).map((c: any) => c.text || '').join('');

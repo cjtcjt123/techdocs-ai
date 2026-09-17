@@ -39,7 +39,7 @@ export interface Quote {
 }
 
 export type ModelSource = 'official' | 'local' | 'nas';
-export type Provider = 'openai' | 'claude' | 'tongyi' | 'zhipu' | 'custom';
+export type Provider = 'openai' | 'claude' | 'deepseek' | 'tongyi' | 'zhipu' | 'custom';
 
 export interface ModelConfig {
   source: ModelSource;

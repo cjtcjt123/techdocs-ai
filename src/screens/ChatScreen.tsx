@@ -8,7 +8,7 @@ import { useStore } from '../store';
 import { Attachment, Message } from '../types';
 
 export default function ChatScreen() {
-  const { conversations, currentConvId, newConversation, sendMessage, runCompliance, thinking, pickAttachments, lastError } = useStore();
+  const { conversations, currentConvId, newConversation, sendMessage, runCompliance, thinking, pickAttachments, pickImage, lastError } = useStore();
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const scrollRef = useRef<ScrollView>(null);
@@ -27,6 +27,16 @@ export default function ChatScreen() {
   const addAttachments = async () => {
     const picked = await pickAttachments();
     if (picked.length) setAttachments((a) => [...a, ...picked]);
+  };
+
+  // 从系统相册选照片（此前这个按钮只弹了一句说明、并没有真正选图）
+  const addPhoto = async () => {
+    try {
+      const picked = await pickImage();
+      if (picked.length) setAttachments((a) => [...a, ...picked]);
+    } catch (e: any) {
+      Alert.alert('相册', e?.message || '选择照片失败');
+    }
   };
 
   const removeAttach = (idx: number) => setAttachments((a) => a.filter((_, i) => i !== idx));
@@ -68,7 +78,7 @@ export default function ChatScreen() {
         <Pressable style={styles.attBtn} onPress={addAttachments}>
           <Text style={{ fontSize: 18 }}>📎</Text>
         </Pressable>
-        <Pressable style={styles.attBtn} onPress={() => Alert.alert('图片', '选择图片文件即可（MVP 暂不支持图片内文字识别，可作为附件携带）。')}>
+        <Pressable style={styles.attBtn} onPress={addPhoto}>
           <Text style={{ fontSize: 18 }}>🖼️</Text>
         </Pressable>
         <TextInput
