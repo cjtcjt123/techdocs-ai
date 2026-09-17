@@ -1,0 +1,39 @@
+build:
+  name: Unsigned iOS IPA (for self-signing)
+  steps:
+    - eas/checkout
+    - eas/install_node_modules
+    - eas/prebuild
+    # Build an UNSIGNED archive: skip all Apple credential steps.
+    - run: |
+        set -e
+        cd ios
+        WS=$(ls *.xcworkspace | head -1)
+        SCHEME=$(basename "$WS" .xcworkspace)
+        echo "Workspace: $WS  Scheme: $SCHEME"
+        xcodebuild -workspace "$WS" -scheme "$SCHEME" \
+          -configuration Release -sdk iphoneos \
+          -archivePath "build/$SCHEME.xcarchive" \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGN_STYLE=Manual \
+          DEVELOPMENT_TEAM="" \
+          clean archive
+    # Package the unsigned .app into an IPA.
+    - run: |
+        set -e
+        cd ios
+        WS=$(ls *.xcworkspace | head -1)
+        SCHEME=$(basename "$WS" .xcworkspace)
+        APP=$(find "build/$SCHEME.xcarchive/Products/Applications" -maxdepth 1 -name "*.app" | head -1)
+        echo "App path: $APP"
+        rm -rf ../build-unsigned && mkdir -p ../build-unsigned/Payload
+        cp -r "$APP" "../build-unsigned/Payload/"
+        cd ../build-unsigned
+        zip -r "../techdocs-ai-unsigned.ipa" Payload
+        ls -lh "../techdocs-ai-unsigned.ipa"
+    # Upload the unsigned IPA as a downloadable artifact.
+    - eas/upload_artifact:
+        inputs:
+          path: techdocs-ai-unsigned.ipa
+          type: application-archive

@@ -1,0 +1,28 @@
+{
+  "cli": {
+    "version": ">= 15.0.0"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "ios": {
+        "simulator": false
+      }
+    },
+    "production": {
+      "distribution": "store"
+    },
+    "unsigned": {
+      "ios": {
+        "config": "unsigned-ios.yml"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "技术资料AI助手",
+    "slug": "techdocs-ai",
+    "owner": "cjtallen",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "techdocsai",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.chenjingtao.techdocsai",
+      "appleTeamId": ""
+    },
+    "android": {
+      "package": "com.yourorg.techdocsai"
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [],
+    "extra": {
+      "eas": {
+        "projectId": "9a87b308-4852-425b-b925-b5196a866107"
+      }
+    }
+  }
+}

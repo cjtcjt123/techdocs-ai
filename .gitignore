@@ -1,0 +1,14 @@
+node_modules/
+.expo/
+dist/
+ios/Pods/
+ios/build/
+android/
+npm-debug.log*
+yarn-error.log*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+.DS_Store
