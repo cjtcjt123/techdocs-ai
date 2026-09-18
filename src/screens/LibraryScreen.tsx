@@ -4,6 +4,7 @@ import {
 } from 'react-native';
 import { colors, mono, radius, shadow, space } from '../theme';
 import Button from '../components/Button';
+import CaseList from '../components/CaseList';
 import { useStore } from '../store';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -29,6 +30,13 @@ const ALL = '__all__';
 const PIN = '__pin__';
 const UNGROUPED = '未分组';
 
+// 标签输入统一按「、」或逗号切分（中英文逗号都认），去空去重。
+// 单独抽出来是因为它有三处调用点（单份编辑 / 批量追加 / 保存），
+// 三处各写一遍迟早分叉 —— 分叉的症状是「批量加标签后出现空标签」。
+function splitTags(text: string): string[] {
+  return Array.from(new Set(text.split(/[、,，]/).map((x) => x.trim()).filter(Boolean)));
+}
+
 function formatSize(n: number): string {
   if (!n) return '';
   if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
@@ -43,9 +51,14 @@ export default function LibraryScreen() {
     attachNasToChat, closeNasDoc, syncFromNas, lastError,
     togglePin, updateDocTags, runSearch, clearSearch,
     searchQuery, searchResults, searching,
+    cases,
   } = useStore();
   const navigation = useNavigation<NativeStackNavigationProp<any>>();
   const mode = settings.dataStrategy;
+
+  // 资料库 / 经验库：两件事共用「本地数据」这一层，所以合在同一屏用分段切换，
+  // 而不是新占一个 Tab（底部只有 4 个位置，经验库还不配挤掉任何一个）。
+  const [tab, setTab] = useState<'docs' | 'cases'>('docs');
 
   const [filter, setFilter] = useState<string>(ALL);
   const [q, setQ] = useState('');
@@ -53,7 +66,18 @@ export default function LibraryScreen() {
   const [sheetDoc, setSheetDoc] = useState<Document | null>(null);
   const [tagEdit, setTagEdit] = useState<{ id: string; text: string } | null>(null);
   const [renameTarget, setRenameTarget] = useState<{ id: string; text: string } | null>(null);
+  // 单个删除也要先确认：这是不可逆操作，误触的代价是整份资料要重新导入+解析。
+  const [delTarget, setDelTarget] = useState<Document | null>(null);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ---- 批量选择 ----
+  // 只允许「进选择态后逐项勾选」，不提供任何形式的「一键全清空」：
+  // 批量删除的破坏面太大，必须让用户对每一份文档做一次明确的勾选动作。
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [batchTag, setBatchTag] = useState<string | null>(null); // null = 关闭；'' = 打开且输入为空
+  const [confirmBatchDel, setConfirmBatchDel] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
 
   const pinnedCount = documents.filter((d) => d.pinned).length;
 
@@ -95,6 +119,55 @@ export default function LibraryScreen() {
     });
   }, [visibleDocs]);
 
+  // ---- 批量选择：派生值与动作 ----
+  const selectedDocs = useMemo(
+    () => documents.filter((d) => selected.includes(d.id)),
+    [documents, selected],
+  );
+  const allVisibleSelected = visibleDocs.length > 0 && visibleDocs.every((d) => selected.includes(d.id));
+  const allPinned = selectedDocs.length > 0 && selectedDocs.every((d) => d.pinned);
+
+  const toggleSelect = (id: string) =>
+    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+  const exitSelect = () => {
+    setSelectMode(false); setSelected([]); setConfirmBatchDel(false); setBatchTag(null);
+  };
+
+  // 全选只作用于【当前筛选结果】，不是全库 —— 否则筛完「⭐ 钉住」再点全选，
+  // 会把屏幕上看不见的文档也一起选进来，接着按删除就是灾难。
+  const toggleSelectAll = () => setSelected(allVisibleSelected ? [] : visibleDocs.map((d) => d.id));
+
+  // 批量钉住让结果【一致】（全钉住 / 全取消），而不是逐个翻转 ——
+  // 逐个翻转在「已钉 + 未钉」的混合选区里会把状态彻底搞乱。
+  const batchPin = async () => {
+    setBatchBusy(true);
+    try {
+      for (const d of selectedDocs) {
+        if (allPinned ? d.pinned : !d.pinned) await togglePin(d.id);
+      }
+    } finally { setBatchBusy(false); exitSelect(); }
+  };
+
+  // 批量加标签是【追加】而非覆盖：覆盖式批量编辑会把各文档原有的标签全部清掉
+  const batchAddTags = async (raw: string) => {
+    const add = splitTags(raw);
+    if (!add.length) { setBatchTag(null); return; }
+    setBatchBusy(true);
+    try {
+      for (const d of selectedDocs) {
+        await updateDocTags(d.id, Array.from(new Set([...(d.tags || []), ...add])));
+      }
+    } finally { setBatchBusy(false); exitSelect(); }
+  };
+
+  const batchDelete = async () => {
+    setBatchBusy(true);
+    try {
+      for (const d of selectedDocs) await removeDoc(d.id);
+    } finally { setBatchBusy(false); exitSelect(); }
+  };
+
   const onSearch = (t: string) => {
     setQ(t);
     // 防抖：逐字触发全库扫描，资料多时会卡（每次都要把 chunks 全表捞出来打分）
@@ -105,6 +178,10 @@ export default function LibraryScreen() {
   const subText = mode === 'nas-only'
     ? `NAS 浏览 · ${nasFiles.length} 项`
     : `${documents.length} 份文档${pinnedCount ? ` · ⭐ 钉住 ${pinnedCount}` : ''}`;
+
+  // 搜索中不给进选择态：此时列表是「搜索结果」，而全选作用于「筛选结果」，
+  // 两套集合混在一起，用户看着搜索结果点全选，实际选中的是另一批 —— 接着按删除就是事故。
+  const canSelect = mode !== 'nas-only' && documents.length > 0 && !q;
 
   // 副标题：型号 · 大小 · 解析来源与规模（"无文本"的文档也一眼看得出卡在哪）。
   // 类型不再写在这里 —— 已经提到文件名前面的 PDF/DOCX 徽章上了，重复一遍只是噪音。
@@ -124,12 +201,19 @@ export default function LibraryScreen() {
 
   const renderDocCard = (d: Document) => {
     const m = statusMeta[d.status];
+    const on = selected.includes(d.id);
     return (
       <Pressable
         key={d.id}
-        onPress={() => navigation.navigate('DocDetail', { docId: d.id })}
-        style={({ pressed }) => [styles.card, pressed && { opacity: 0.75 }]}
+        // 选择态下点卡片 = 勾选，不再跳详情。否则一点就离开列表，没法连续勾选几份。
+        onPress={() => (selectMode ? toggleSelect(d.id) : navigation.navigate('DocDetail', { docId: d.id }))}
+        style={({ pressed }) => [styles.card, on && styles.cardOn, pressed && { opacity: 0.75 }]}
       >
+        {selectMode && (
+          <View style={[styles.check, on && styles.checkOn]}>
+            {on ? <Text style={styles.checkMark}>✓</Text> : null}
+          </View>
+        )}
         <View style={{ flex: 1, minWidth: 0 }}>
           <View style={styles.nameRow}>
             <Text style={styles.ex}>{d.type.toUpperCase()}</Text>
@@ -142,13 +226,15 @@ export default function LibraryScreen() {
         <View style={[styles.badge, { backgroundColor: m.bg }]}>
           <Text style={[styles.badgeText, { color: m.fg }]}>{m.label}</Text>
         </View>
-        <Pressable
-          hitSlop={8}
-          onPress={() => setSheetDoc(d)}
-          style={styles.moreBtn}
-        >
-          <Text style={styles.moreText}>⋯</Text>
-        </Pressable>
+        {!selectMode && (
+          <Pressable
+            hitSlop={8}
+            onPress={() => setSheetDoc(d)}
+            style={styles.moreBtn}
+          >
+            <Text style={styles.moreText}>⋯</Text>
+          </Pressable>
+        )}
       </Pressable>
     );
   };
@@ -156,11 +242,42 @@ export default function LibraryScreen() {
   return (
     <View style={styles.container}>
       <View style={styles.head}>
-        <Text style={styles.title}>资料库</Text>
-        <Text style={styles.sub}>{subText}</Text>
+        <View style={styles.headLeft}>
+          <Text style={styles.title}>{tab === 'cases' ? '经验库' : '资料库'}</Text>
+          <Text style={styles.sub}>
+            {tab === 'cases' ? '' : selectMode ? `已选 ${selected.length}` : subText}
+          </Text>
+        </View>
+        {canSelect && tab === 'docs' && (
+          <Pressable
+            hitSlop={8}
+            onPress={selectMode ? exitSelect : () => setSelectMode(true)}
+            style={styles.selBtn}
+          >
+            <Text style={styles.selBtnText}>{selectMode ? '完成' : '选择'}</Text>
+          </Pressable>
+        )}
       </View>
 
-      {mode !== 'nas-only' && (
+      {/* 分段切换。切走时顺手退出选择态 —— 否则回来时会带着一批「看不见的勾选」，
+          而全选/批量动作又只作用于当前列表，两边对不上。 */}
+      <View style={styles.segRow}>
+        {([['docs', '资料库'], ['cases', '经验库']] as const).map(([k, label]) => (
+          <Pressable
+            key={k}
+            onPress={() => { if (k === 'cases') exitSelect(); setTab(k); }}
+            style={[styles.chip, styles.segChip, tab === k && styles.chipOn]}
+          >
+            <Text style={[styles.chipText, tab === k && styles.chipTextOn]}>{label}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      {tab === 'cases' ? (
+        <CaseList />
+      ) : (
+        <>
+      {mode !== 'nas-only' && !selectMode && (
         <View style={styles.searchWrap}>
           <TextInput
             value={q}
@@ -178,7 +295,7 @@ export default function LibraryScreen() {
         </View>
       )}
 
-      {mode !== 'nas-only' && !!q ? (
+      {mode !== 'nas-only' && !!q && !selectMode ? (
         // ---------- 搜索结果：直接看命中的原文片段 ----------
         <ScrollView style={styles.list} contentContainerStyle={styles.listInner}>
           <Text style={styles.resultHint}>
@@ -201,8 +318,8 @@ export default function LibraryScreen() {
             <View style={styles.empty}>
               <Text style={styles.emptyText}>没有命中。</Text>
               <Text style={styles.emptyHint}>
-                换关键词试试（多个词用空格分隔）。注意：PDF / Word 目前只入库了文件名、正文还没解析，
-                所以搜不到里面的内容——这是下一批要补的。
+                换关键词试试（多个词用空格分隔）。若这份资料是扫描件（整页图片、没有文字层），
+                正文提不出来，所以搜不到 —— 那类需要 OCR，目前还没做。
               </Text>
             </View>
           )}
@@ -258,8 +375,8 @@ export default function LibraryScreen() {
                 <View style={styles.empty}>
                   <Text style={styles.emptyText}>还没有资料。点下方「导入文档」开始。</Text>
                   <Text style={styles.emptyHint}>
-                    支持 PDF / Word / Markdown / TXT。目前 PDF·Word 只入库文件名（正文解析在下一批），
-                    TXT / MD 可直接被搜索与问答引用。
+                    支持 PDF / Word / Markdown / TXT，导入时就解析入库，可直接被搜索与问答引用。
+                    扫描件（整页图片的 PDF）暂时提不出文字，会标成「无文本」。
                   </Text>
                 </View>
               )}
@@ -282,7 +399,45 @@ export default function LibraryScreen() {
       )}
 
       <View style={styles.action}>
-        {mode === 'nas-only' ? (
+        {selectMode ? (
+          <>
+            <View style={styles.batchRow}>
+              <Button
+                label={allVisibleSelected ? '取消全选' : '全选当前'}
+                variant="ghost"
+                onPress={toggleSelectAll}
+                disabled={!visibleDocs.length || batchBusy}
+                style={{ flex: 1 }}
+              />
+              <Button
+                label="加标签"
+                variant="soft"
+                onPress={() => setBatchTag('')}
+                disabled={!selected.length || batchBusy}
+                style={{ flex: 1, marginLeft: space.s2 }}
+              />
+            </View>
+            <View style={[styles.batchRow, { marginTop: space.s2 }]}>
+              <Button
+                label={allPinned ? '取消钉住' : '⭐ 钉住'}
+                variant="soft"
+                onPress={batchPin}
+                disabled={!selected.length || batchBusy}
+                style={{ flex: 1 }}
+              />
+              <Button
+                label={batchBusy ? '处理中…' : `删除${selected.length ? ` ${selected.length}` : ''}`}
+                variant="danger"
+                onPress={() => setConfirmBatchDel(true)}
+                disabled={!selected.length || batchBusy}
+                style={{ flex: 1, marginLeft: space.s2 }}
+              />
+            </View>
+            <Text style={styles.batchHint}>
+              已选 {selected.length} 份 · 全选只作用于当前筛选结果
+            </Text>
+          </>
+        ) : mode === 'nas-only' ? (
           <Button label={nasScanning ? '读取中…' : '浏览 NAS'} onPress={browseNas} disabled={nasScanning} />
         ) : (
           <>
@@ -329,7 +484,7 @@ export default function LibraryScreen() {
             <ActionRow
               label="删除"
               danger
-              onPress={() => { const id = sheetDoc.id; setSheetDoc(null); void removeDoc(id); }}
+              onPress={() => { setDelTarget(sheetDoc); setSheetDoc(null); }}
             />
             <Button label="取消" variant="ghost" onPress={() => setSheetDoc(null)} style={{ marginTop: space.s2 }} />
           </View>
@@ -354,12 +509,14 @@ export default function LibraryScreen() {
             <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: space.s2 }}>
               <View style={styles.chipsInner}>
                 {TAG_SUGGEST.map((t) => {
-                  const has = tagEdit.text.includes(t);
+                  // 用 splitTags 判存在，而不是 text.includes(t)：
+                  // 后者会让「TDS报告」把标签 TDS 误显示成已选中，一点反而把它删掉。
+                  const has = splitTags(tagEdit.text).includes(t);
                   return (
                     <Pressable
                       key={t}
                       onPress={() => {
-                        const parts = tagEdit.text.split(/[、,，]/).map((x) => x.trim()).filter(Boolean);
+                        const parts = splitTags(tagEdit.text);
                         const next = has ? parts.filter((x) => x !== t) : [...parts, t];
                         setTagEdit({ ...tagEdit, text: next.join('、') });
                       }}
@@ -376,8 +533,7 @@ export default function LibraryScreen() {
               <Button
                 label="保存"
                 onPress={() => {
-                  const parts = tagEdit.text.split(/[、,，]/).map((x) => x.trim()).filter(Boolean);
-                  void updateDocTags(tagEdit.id, parts);
+                  void updateDocTags(tagEdit.id, splitTags(tagEdit.text));
                   setTagEdit(null);
                 }}
                 style={{ flex: 1, marginLeft: space.s2 }}
@@ -416,6 +572,117 @@ export default function LibraryScreen() {
         </View>
       )}
 
+      {/* ---------- 删除确认（单份）---------- */}
+      {delTarget && (
+        <View style={styles.overlay}>
+          <Pressable style={{ flex: 1 }} onPress={() => setDelTarget(null)} />
+          <View style={styles.sheet}>
+            <Text style={styles.sheetTitle}>删除这份资料？</Text>
+            <Text style={styles.fieldHint} numberOfLines={3}>{delTarget.name}</Text>
+            <Text style={styles.warnText}>
+              文档、已提取的正文、向量索引会一起删掉，无法撤销 —— 要恢复只能重新导入并解析一次。
+            </Text>
+            <View style={styles.sheetBtns}>
+              <Button label="取消" variant="ghost" onPress={() => setDelTarget(null)} style={{ flex: 1 }} />
+              <Button
+                label="确认删除"
+                variant="danger"
+                onPress={() => { const id = delTarget.id; setDelTarget(null); void removeDoc(id); }}
+                style={{ flex: 1, marginLeft: space.s2 }}
+              />
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* ---------- 批量删除确认 ---------- */}
+      {/* 逐份列出将删除的文件名：批量删除最危险的失败模式是「选多了却不知道多了谁」，
+          只报个数等于把核对成本推给用户。有名单就能一眼看出多勾了哪份。 */}
+      {confirmBatchDel && (
+        <View style={styles.overlay}>
+          <Pressable style={{ flex: 1 }} onPress={() => setConfirmBatchDel(false)} />
+          <View style={styles.sheet}>
+            <Text style={styles.sheetTitle}>删除这 {selectedDocs.length} 份资料？</Text>
+            <ScrollView style={styles.sheetBody}>
+              {selectedDocs.map((d) => (
+                <Text key={d.id} style={styles.delItem} numberOfLines={1}>· {d.name}</Text>
+              ))}
+            </ScrollView>
+            <Text style={styles.warnText}>
+              以上 {selectedDocs.length} 份的正文与索引会一起删掉，无法撤销。
+              若其中有不想删的，先「返回勾选」把它取消掉。
+            </Text>
+            <View style={styles.sheetBtns}>
+              <Button
+                label="返回勾选"
+                variant="ghost"
+                onPress={() => setConfirmBatchDel(false)}
+                disabled={batchBusy}
+                style={{ flex: 1 }}
+              />
+              <Button
+                label={batchBusy ? '删除中…' : `确认删除 ${selectedDocs.length} 份`}
+                variant="danger"
+                onPress={batchDelete}
+                disabled={batchBusy}
+                style={{ flex: 1, marginLeft: space.s2 }}
+              />
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* ---------- 批量加标签 ---------- */}
+      {batchTag !== null && (
+        <View style={styles.overlay}>
+          <Pressable style={{ flex: 1 }} onPress={() => setBatchTag(null)} />
+          <View style={styles.sheet}>
+            <Text style={styles.sheetTitle}>给 {selectedDocs.length} 份加标签</Text>
+            <Text style={styles.fieldHint}>
+              追加式：各文档原有的标签会保留。多个标签用「、」或逗号分隔。
+            </Text>
+            <TextInput
+              value={batchTag}
+              onChangeText={setBatchTag}
+              placeholder="例如：Araldite、CY1578"
+              placeholderTextColor={colors.muted}
+              style={styles.field}
+              autoFocus
+              autoCorrect={false}
+            />
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: space.s2 }}>
+              <View style={styles.chipsInner}>
+                {TAG_SUGGEST.map((t) => {
+                  const has = splitTags(batchTag).includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => {
+                        const parts = splitTags(batchTag);
+                        const next = has ? parts.filter((x) => x !== t) : [...parts, t];
+                        setBatchTag(next.join('、'));
+                      }}
+                      style={[styles.chip, has && styles.chipOn]}
+                    >
+                      <Text style={[styles.chipText, has && styles.chipTextOn]}>{has ? `✓ ${t}` : `＋ ${t}`}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </ScrollView>
+            <View style={styles.sheetBtns}>
+              <Button label="取消" variant="ghost" onPress={() => setBatchTag(null)} style={{ flex: 1 }} />
+              <Button
+                label={batchBusy ? '处理中…' : '加进去'}
+                onPress={() => void batchAddTags(batchTag)}
+                disabled={batchBusy || !splitTags(batchTag).length}
+                style={{ flex: 1, marginLeft: space.s2 }}
+              />
+            </View>
+          </View>
+        </View>
+      )}
+
       {nasCurrent && (
         <View style={styles.overlay}>
           <View style={styles.sheet}>
@@ -433,6 +700,8 @@ export default function LibraryScreen() {
             </View>
           </View>
         </View>
+      )}
+        </>
       )}
     </View>
   );
@@ -452,6 +721,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.s3, paddingTop: space.s0, paddingBottom: space.s2,
     flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between',
   },
+  headLeft: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'flex-end', gap: space.s2 },
+  // 进入批量选择的入口做成文字按钮而不是图标：图标在这个项目里没有图标库可依赖（零新增依赖），
+  // 文字「选择 / 完成」也自带状态说明，不用额外解释。
+  selBtn: {
+    paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999,
+    borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, marginBottom: 2,
+  },
+  selBtnText: { fontSize: 12.5, fontWeight: '600', color: colors.primary },
   title: { fontSize: 26, fontWeight: '700', color: colors.text, letterSpacing: -0.8 },
   sub: { fontFamily: mono, fontSize: 11, color: colors.muted, paddingBottom: 4 },
   searchWrap: { paddingHorizontal: space.s3, paddingBottom: space.s2, position: 'relative' },
@@ -474,6 +751,12 @@ const styles = StyleSheet.create({
   chipOn: { backgroundColor: colors.primarySoft, borderColor: colors.primary },
   chipText: { fontSize: 12.5, color: colors.muted, fontWeight: '600' },
   chipTextOn: { color: colors.primary },
+  // 分段切换：两个等宽 chip 铺满一行。等宽是为了「选中态移动」时位置稳定，不随字数抖动。
+  segRow: {
+    flexDirection: 'row', gap: 8,
+    paddingHorizontal: space.s3, paddingBottom: space.s2,
+  },
+  segChip: { flex: 1, alignItems: 'center', paddingVertical: 7 },
   groupHead: {
     fontFamily: mono, fontSize: 10, letterSpacing: 1.4, color: colors.muted,
     textTransform: 'uppercase', marginBottom: 8, marginTop: 10, marginHorizontal: 2,
@@ -485,8 +768,23 @@ const styles = StyleSheet.create({
     backgroundColor: colors.card, borderRadius: radius.xl,
     paddingHorizontal: space.s2 + 2, paddingVertical: space.s2, marginBottom: space.s1 + 2,
     flexDirection: 'row', alignItems: 'center', gap: 10,
+    // 边框常驻（未选中时透明）：只在选中时加 borderWidth 会让卡片上下各跳 1px，
+    // 勾选几份时整列表会跳来跳去。
+    borderWidth: 1, borderColor: 'transparent',
     ...shadow.card,
   },
+  cardOn: { borderColor: colors.primary, backgroundColor: colors.primarySoft },
+  // 勾选圈用 View 画（同 TabGlyph 的理由：不引图标库，原生与 web 表现一致）
+  check: {
+    width: 20, height: 20, borderRadius: 10, borderWidth: 1.5,
+    borderColor: colors.border, alignItems: 'center', justifyContent: 'center',
+  },
+  checkOn: { backgroundColor: colors.primary, borderColor: colors.primary },
+  checkMark: { fontSize: 12, lineHeight: 14, fontWeight: '700', color: '#fff' },
+  batchRow: { flexDirection: 'row' },
+  batchHint: { fontFamily: mono, fontSize: 10.5, color: colors.muted, marginTop: space.s2, textAlign: 'center' },
+  warnText: { fontSize: 12, color: colors.red, lineHeight: 18, marginBottom: space.s2 },
+  delItem: { fontSize: 12.5, color: colors.text, lineHeight: 19 },
   nameRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   // 类型徽章提到名字前面：一眼分清 TDS 和规格书，不用去读文件名后缀
   ex: {
