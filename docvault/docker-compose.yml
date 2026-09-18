@@ -1,0 +1,17 @@
+services:
+  docvault:
+    build: .
+    container_name: docvault
+    restart: unless-stopped
+    ports:
+      - "8790:8790"
+    environment:
+      # 第一次启动才有用：库里已有用户时这两个变量被忽略。
+      # 不设 DOCVAULT_ADMIN_PASSWORD 就随机生成，并打到启动日志里（docker compose logs docvault）。
+      DOCVAULT_ADMIN_USER: ${DOCVAULT_ADMIN_USER:-admin}
+      DOCVAULT_ADMIN_PASSWORD: ${DOCVAULT_ADMIN_PASSWORD:-}
+    volumes:
+      - ./data:/data
+
+# 为什么不带 Postgres：就 2 张表、全是等值查询，SQLite + WAL 完全够。
+# C 方案（多用户）也还是它 —— 换库只会多出备份/迁移/恢复三件麻烦事。

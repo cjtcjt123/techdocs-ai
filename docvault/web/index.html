@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>京美AI助手 · 后端管理</title>
+<style>
+  /* 与 App 同一套观感：主色紫 #5e5ce6、毛玻璃卡片、小卡片一眼即懂。
+     页面是纯静态的，数据全部来自接口 —— C 方案那天只换这一个文件。 */
+  :root{
+    --bg:#f2f2f7; --card:rgba(255,255,255,.72); --line:rgba(0,0,0,.08);
+    --ink:#1c1c1e; --sub:#6b6b70; --accent:#5e5ce6; --danger:#d70015; --ok:#1c8c4a;
+    --warn:#b25e00; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:28px 20px 60px}
+  h1{font-size:19px;margin:0;font-weight:650}
+  .sub{color:var(--sub);font-size:13px}
+  .card{background:var(--card);backdrop-filter:saturate(180%) blur(20px);
+    border:1px solid var(--line);border-radius:16px;padding:18px 20px;
+    box-shadow:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.05);margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 14px;font-weight:650;display:flex;align-items:center;gap:8px}
+  .card h2 .n{font:12px/1 var(--mono);color:var(--sub);background:rgba(0,0,0,.05);
+    padding:3px 7px;border-radius:6px}
+  .top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}
+  .pill{font:12px/1 var(--mono);padding:5px 10px;border-radius:999px;
+    background:rgba(94,92,230,.12);color:var(--accent)}
+  .pill.off{background:rgba(215,0,21,.1);color:var(--danger)}
+  button{font:inherit;font-size:13px;border:1px solid var(--line);background:#fff;
+    color:var(--ink);border-radius:9px;padding:6px 12px;cursor:pointer}
+  button:hover{border-color:rgba(0,0,0,.2)}
+  button.p{background:var(--accent);color:#fff;border-color:transparent}
+  button.d{color:var(--danger)}
+  button:disabled{opacity:.5;cursor:default}
+  input{font:inherit;font-size:14px;border:1px solid var(--line);border-radius:9px;
+    padding:8px 11px;background:#fff;min-width:0}
+  input:focus{outline:2px solid rgba(94,92,230,.35);border-color:transparent}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th{text-align:left;font-weight:600;color:var(--sub);font-size:12px;
+    padding:0 10px 8px 0;border-bottom:1px solid var(--line)}
+  td{padding:9px 10px 9px 0;border-bottom:1px solid rgba(0,0,0,.05);vertical-align:middle}
+  tr:last-child td{border-bottom:0}
+  code,.m{font-family:var(--mono);font-size:12.5px}
+  .m{color:var(--sub)}
+  .tag{display:inline-block;font:11px/1 var(--mono);padding:3px 6px;border-radius:5px;
+    background:rgba(0,0,0,.06);color:var(--sub)}
+  .tag.a{background:rgba(94,92,230,.14);color:var(--accent)}
+  .tag.x{background:rgba(215,0,21,.1);color:var(--danger)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .kpi{background:rgba(255,255,255,.6);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .kpi .v{font:22px/1.2 var(--mono);margin-top:2px}
+  .err{color:var(--danger);font-size:13px;min-height:18px}
+  .hide{display:none!important}
+  .mask{position:fixed;inset:0;background:rgba(0,0,0,.32);display:flex;
+    align-items:center;justify-content:center;padding:20px;z-index:9}
+  .modal{background:#fff;border-radius:16px;padding:22px;max-width:560px;width:100%;
+    box-shadow:0 24px 60px rgba(0,0,0,.28)}
+  .secret{font-family:var(--mono);font-size:13px;word-break:break-all;background:#f6f6f9;
+    border:1px solid var(--line);border-radius:10px;padding:12px;margin:12px 0}
+  .hint{font-size:12.5px;color:var(--warn);background:rgba(178,94,0,.08);
+    border-radius:9px;padding:9px 11px;margin-bottom:4px}
+  .login{max-width:380px;margin:12vh auto}
+  .login input{width:100%;margin-bottom:10px}
+  .login button{width:100%;padding:10px}
+</style>
+</head>
+<body>
+
+<!-- 登录 -->
+<div id="login" class="wrap login">
+  <div class="card">
+    <h1>京美AI助手 · 后端管理</h1>
+    <p class="sub" style="margin:4px 0 18px">用账号密码换一把令牌，令牌存在这台浏览器里。</p>
+    <input id="lu" placeholder="用户名" autocomplete="username" />
+    <input id="lp" type="password" placeholder="密码" autocomplete="current-password" />
+    <div class="err" id="lerr"></div>
+    <button class="p" id="lbtn">登录</button>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="main" class="wrap hide">
+  <div class="top">
+    <div>
+      <h1>京美AI助手 · 后端管理</h1>
+      <div class="sub" id="whoami">—</div>
+    </div>
+    <div class="row">
+      <span class="pill" id="health">检查中…</span>
+      <button id="out">登出</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>服务状态</h2>
+    <div class="grid" id="kpis"></div>
+  </div>
+
+  <div class="card">
+    <h2>用户 <span class="n" id="n-users">0</span></h2>
+    <div class="row" style="margin-bottom:14px">
+      <input id="nu" placeholder="用户名" />
+      <input id="np" type="password" placeholder="初始密码（≥6 位）" />
+      <select id="nr" style="font:inherit;padding:8px;border-radius:9px;border:1px solid var(--line)">
+        <option value="user">普通用户</option>
+        <option value="admin">管理员</option>
+      </select>
+      <button class="p" id="add-user">开一个账号</button>
+    </div>
+    <div class="err" id="uerr"></div>
+    <table><thead><tr>
+      <th>用户名</th><th>角色</th><th>状态</th><th>令牌</th><th>Key</th><th>创建</th><th></th>
+    </tr></thead><tbody id="users"></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>App 令牌 <span class="n" id="n-tokens">0</span></h2>
+    <p class="sub" style="margin:-6px 0 12px">给装了 App 的设备用。App 里填进「服务器地址 + 令牌」就能登录。</p>
+    <div class="row" style="margin-bottom:14px">
+      <input id="tn" placeholder="给这把令牌起个名，例如 我的 iPhone" />
+      <input id="td" type="number" placeholder="有效天数（留空=永久）" style="width:190px" />
+      <button class="p" id="add-token">签发令牌</button>
+    </div>
+    <table><thead><tr>
+      <th>名称</th><th>归属</th><th>前缀</th><th>最后使用</th><th>到期</th><th>状态</th><th></th>
+    </tr></thead><tbody id="tokens"></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>外部 API Key <span class="n" id="n-keys">0</span></h2>
+    <p class="sub" style="margin:-6px 0 12px">给别的程序用（脚本、同事的系统）。请求头带
+      <code>Authorization: Bearer &lt;Key&gt;</code> 即可调用。</p>
+    <div class="row" style="margin-bottom:14px">
+      <input id="kn" placeholder="给这把 Key 起个名，例如 报价脚本" />
+      <input id="kd" type="number" placeholder="有效天数（留空=永久）" style="width:190px" />
+      <button class="p" id="add-key">签发 Key</button>
+    </div>
+    <table><thead><tr>
+      <th>名称</th><th>归属</th><th>前缀</th><th>最后使用</th><th>到期</th><th>状态</th><th></th>
+    </tr></thead><tbody id="keys"></tbody></table>
+  </div>
+</div>
+
+<script>
+const KEY = 'docvault.token';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = (t) => (t ? String(t).replace('T', ' ').slice(5, 16) : '—');
+
+function token() { return localStorage.getItem(KEY) || ''; }
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token(), ...(opts.headers || {}) },
+  });
+  const txt = await r.text();
+  const data = txt ? JSON.parse(txt) : null;
+  if (!r.ok) throw new Error((data && (data.detail || data.message)) || ('HTTP ' + r.status));
+  return data;
+}
+
+// ---- 凭据明文只出现这一次，必须当场让人复制走 ----
+function showSecret(title, secret) {
+  const m = document.createElement('div');
+  m.className = 'mask';
+  m.innerHTML = `<div class="modal">
+    <h1>${esc(title)}</h1>
+    <div class="hint">这串东西<b>只显示这一次</b>，库里存的是哈希、找不回来。现在复制走，丢了就重新签发。</div>
+    <div class="secret" id="sv">${esc(secret)}</div>
+    <div class="row" style="justify-content:flex-end">
+      <button id="cp">复制</button>
+      <button class="p" id="cl">我已经复制好了</button>
+    </div></div>`;
+  document.body.appendChild(m);
+  m.querySelector('#cp').onclick = async () => {
+    try { await navigator.clipboard.writeText(secret); m.querySelector('#cp').textContent = '已复制'; }
+    catch { const r = document.createRange(); r.selectNode(m.querySelector('#sv'));
+            getSelection().removeAllRanges(); getSelection().addRange(r); }
+  };
+  m.querySelector('#cl').onclick = () => m.remove();
+}
+
+// ---- 登录 ----
+$('lbtn').onclick = async () => {
+  $('lerr').textContent = '';
+  $('lbtn').disabled = true;
+  try {
+    const d = await fetch('/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('lu').value.trim(), password: $('lp').value }),
+    }).then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.detail || '登录失败'); return j; });
+    localStorage.setItem(KEY, d.token);
+    showSecret('登录成功，这是你的 App 令牌', d.token);
+    boot();
+  } catch (e) { $('lerr').textContent = e.message; }
+  $('lbtn').disabled = false;
+};
+$('lp').onkeydown = (e) => { if (e.key === 'Enter') $('lbtn').click(); };
+$('out').onclick = () => { localStorage.removeItem(KEY); location.reload(); };
+
+// ---- 渲染 ----
+async function boot() {
+  if (!token()) { $('login').classList.remove('hide'); $('main').classList.add('hide'); return; }
+  $('login').classList.add('hide'); $('main').classList.remove('hide');
+  try { await load(); } catch (e) {
+    if (/401|令牌|停用/.test(e.message)) { localStorage.removeItem(KEY); location.reload(); }
+    else $('health').textContent = '出错：' + e.message;
+  }
+}
+
+async function load() {
+  const h = await fetch('/health').then((r) => r.json());
+  $('health').textContent = h.ok ? `在线 · v${h.version}` : '离线';
+  $('health').classList.toggle('off', !h.ok);
+  $('kpis').innerHTML = [['用户', h.users], ['App 令牌', h.tokens], ['API Key', h.api_keys]]
+    .map(([k, v]) => `<div class="kpi"><div class="sub">${k}</div><div class="v">${v}</div></div>`).join('');
+
+  const me = await api('/auth/me');
+  $('whoami').textContent = `${me.username} · ${me.role === 'admin' ? '管理员' : '普通用户'}`;
+
+  const [users, tokens, keys] = await Promise.all([
+    me.role === 'admin' ? api('/users') : Promise.resolve([]),
+    api('/tokens'), api('/api-keys'),
+  ]);
+  renderUsers(users, me);
+  renderCreds('tokens', tokens);
+  renderCreds('keys', keys);
+  $('n-users').textContent = users.length;
+  $('n-tokens').textContent = tokens.filter((t) => !t.revoked).length;
+  $('n-keys').textContent = keys.filter((k) => !k.revoked).length;
+}
+
+function renderUsers(rows, me) {
+  $('users').innerHTML = rows.map((u) => `<tr>
+    <td><b>${esc(u.username)}</b>${u.note ? `<div class="m">${esc(u.note)}</div>` : ''}</td>
+    <td>${u.role === 'admin' ? '<span class="tag a">管理员</span>' : '<span class="tag">用户</span>'}</td>
+    <td>${u.disabled ? '<span class="tag x">已停用</span>' : '<span class="tag">正常</span>'}</td>
+    <td class="m">${u.tokens}</td><td class="m">${u.api_keys}</td>
+    <td class="m">${fmt(u.created_at)}</td>
+    <td><div class="row">
+      <button data-act="pw" data-id="${u.id}">改密码</button>
+      <button data-act="tg" data-id="${u.id}" data-off="${u.disabled ? 0 : 1}">${u.disabled ? '启用' : '停用'}</button>
+      ${u.id === me.id ? '' : `<button class="d" data-act="rm" data-id="${u.id}">删除</button>`}
+    </div></td></tr>`).join('') || '<tr><td colspan="7" class="m">还没有用户</td></tr>';
+}
+
+function renderCreds(tbody, rows) {
+  $(tbody).innerHTML = rows.map((c) => `<tr>
+    <td><b>${esc(c.name || '(未命名)')}</b></td>
+    <td class="m">${esc(c.username || '')}</td>
+    <td class="m">${esc(c.prefix)}…</td>
+    <td class="m">${fmt(c.last_used_at)}</td>
+    <td class="m">${c.expires_at ? fmt(c.expires_at) : '永久'}</td>
+    <td>${c.revoked ? '<span class="tag x">已吊销</span>' : '<span class="tag">有效</span>'}</td>
+    <td>${c.revoked ? '' : `<button class="d" data-act="rv" data-id="${c.id}">吊销</button>`}</td>
+  </tr>`).join('') || `<tr><td colspan="7" class="m">还没有</td></tr>`;
+}
+
+// ---- 动作 ----
+document.body.addEventListener('click', async (e) => {
+  const b = e.target.closest('button[data-act]');
+  if (!b) return;
+  const { act, id, off } = b.dataset;
+  b.disabled = true;
+  try {
+    if (act === 'pw') {
+      const pw = prompt('新的密码（≥6 位）');
+      if (!pw) return;
+      await api('/users/' + id, { method: 'PATCH', body: JSON.stringify({ password: pw }) });
+    } else if (act === 'tg') {
+      await api('/users/' + id, { method: 'PATCH', body: JSON.stringify({ disabled: off === '1' }) });
+    } else if (act === 'rm') {
+      if (!confirm('删除这个用户？他名下的令牌和 Key 会一起失效。')) return;
+      await api('/users/' + id, { method: 'DELETE' });
+    } else if (act === 'rv') {
+      if (!confirm('吊销后立刻失效，且不能恢复。继续？')) return;
+      const kind = b.closest('table').parentElement.querySelector('h2').textContent.includes('API') ? 'api-keys' : 'tokens';
+      await api('/' + kind + '/' + id, { method: 'DELETE' });
+    }
+    await load();
+  } catch (err) { alert(err.message); }
+  b.disabled = false;
+});
+
+$('add-user').onclick = async (e) => {
+  $('uerr').textContent = '';
+  e.target.disabled = true;
+  try {
+    await api('/users', { method: 'POST', body: JSON.stringify({
+      username: $('nu').value.trim(), password: $('np').value, role: $('nr').value }) });
+    $('nu').value = ''; $('np').value = '';
+    await load();
+  } catch (err) { $('uerr').textContent = err.message; }
+  e.target.disabled = false;
+};
+
+async function issue(path, nameEl, daysEl, label) {
+  const name = $(nameEl).value.trim();
+  if (!name) { alert('先给它起个名字 —— 以后靠名字认出是哪一把该吊销。'); return; }
+  const days = $(daysEl).value ? Number($(daysEl).value) : null;
+  const d = await api(path, { method: 'POST', body: JSON.stringify({ name, expires_days: days }) });
+  showSecret(label + '：' + name, d.secret);
+  $(nameEl).value = ''; $(daysEl).value = '';
+  await load();
+}
+$('add-token').onclick = (e) => { e.target.disabled = true; issue('/tokens', 'tn', 'td', 'App 令牌')
+  .catch((err) => alert(err.message)).finally(() => (e.target.disabled = false)); };
+$('add-key').onclick = (e) => { e.target.disabled = true; issue('/api-keys', 'kn', 'kd', 'API Key')
+  .catch((err) => alert(err.message)).finally(() => (e.target.disabled = false)); };
+
+boot();
+</script>
+</body>
+</html>
