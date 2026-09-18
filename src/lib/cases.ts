@@ -41,24 +41,82 @@ export const VERDICT_TO_OUTCOME: Record<'ok' | 'warn' | 'no', CaseOutcome> = {
 export const OUTCOMES: CaseOutcome[] = ['success', 'partial', 'fail'];
 
 /**
+ * 案例头部标签 —— 【按结果分档】，不再一律写「已验证案例」。
+ *
+ * 为什么必须分档（这曾经是个真错，2026-09-18 修）：
+ *   原来不管什么结果，第一行一律是「【已验证案例】」，而提示词里又写着「案例优先级最高、
+ *   两者冲突时以案例为准」。于是一条「改用 B 方案也没成、最后放弃」的记录，会戴着
+ *   「用户亲手验证过、以此为准」的身份进入之后的每一次问答 —— 模型把一条【已被证伪的做法】
+ *   当成权威结论推荐出去。用户看不到提示词，只会觉得「AI 怎么又让我照这个做，我明明记过它不行」。
+ *
+ *   失败记录的价值在「别走这条路」，不在「这条路走得通」。这两件事必须在文本里就分开 ——
+ *   模型唯一能看到的就是这段文本，不能指望它从「结果：失败」那一行自己推出来
+ *   （那行排在「最终解决」之后，而「最终解决」这个字段名本身就在暗示「照这个做」）。
+ */
+export const CASE_HEADER: Record<CaseOutcome, string> = {
+  success: '【已验证案例 · 成功】',
+  partial: '【已验证案例 · 部分成功】',
+  fail: '【已验证案例 · 失败 · 此路不通，不要照做】',
+};
+
+/**
+ * 上下文里 `[来源N]` 行用的标签。
+ * 与 CASE_HEADER 的措辞【刻意不同】：正文第一行已经写了「此路不通，不要照做」，
+ * 这里再说一遍是噪音，而且真正的执行规则写在系统提示词里（store.ts 的 sys）。
+ * 这里只负责一件事：让模型一眼分清「这条是能照做的经验」还是「这条是试过没成的记录」。
+ */
+export const CASE_SOURCE_LABEL: Record<CaseOutcome, string> = {
+  success: '你已验证的经验案例',
+  partial: '你已验证的经验案例（部分成功）',
+  fail: '你的失败记录（试过，没成）',
+};
+
+/** 取头部标签。outcome 缺失（老数据 / 手工构造）时退回中性的「已验证案例」，不抛错 */
+export function caseHeader(outcome?: CaseOutcome): string {
+  return (outcome && CASE_HEADER[outcome]) || '【已验证案例】';
+}
+
+/** 取来源标签。缺失时按「成功」处理 —— 宁可少提醒，也不能把一条正常案例标成失败 */
+export function caseSourceLabel(outcome?: CaseOutcome): string {
+  return (outcome && CASE_SOURCE_LABEL[outcome]) || CASE_SOURCE_LABEL.success;
+}
+
+/**
+ * `finalFix` 这个字段的显示名 —— 它在两种结果下的含义根本不同：
+ *   · 成功 / 部分成功：用户最后真正有效的那个操作 → 「最终解决」
+ *   · 失败：用户试过但没成的做法 → 「试过的做法（未成功）」
+ * 失败案例里仍写成「最终解决」，等于用字段名暗示「照这个做」，而这正是要避免的误导。
+ *
+ * 抽成一处是因为它有【四个渲染点】：喂模型的语料（caseToText）、导出给人看的档案
+ * （casesToMarkdown）、详情弹层（CaseList）、记录表单的字段名。任何一处漏改，
+ * 同一份数据在不同的地方就会有两种说法。
+ */
+export function finalFixLabel(outcome?: CaseOutcome): string {
+  return outcome === 'fail' ? '试过的做法（未成功）' : '最终解决';
+}
+
+/**
  * 案例 → 可检索文本。
  *
- * 三个刻意的选择：
+ * 四个刻意的选择：
  *   · 字段名（「根因」「最终解决」）原样写进文本 —— 用户问「根因是什么」时也该命中；
  *     只拼值的话，「根因」这个词在语料里根本不存在
- *   · 带上「已验证案例」这四个字 —— 它让模型在上下文里一眼看出这条的来源性质
+ *   · 头部【按结果分档】（见 CASE_HEADER）
  *   · 带上记录日期 —— 回答里要能说「根据你 08-12 的记录」，日期必须进上下文
+ *   · 失败案例的 finalFix 字段名写成「试过的做法（未成功）」而不是「最终解决」——
+ *     失败案例里这个字段装的是「试了什么」，写成「最终解决」等于用字段名暗示「照这个做」。
+ *     表单那边的措辞同步改了，否则用户填的时候也会被问懵。
  */
 export function caseToText(c: CaseRecord, withMeta = true): string {
   const lines: string[] = [];
-  lines.push(`【已验证案例】${c.title || '(未命名)'}`);
+  lines.push(`${caseHeader(c.outcome)}${c.title || '(未命名)'}`);
   const envBits = [c.product && `产品/型号：${c.product}`, c.environment && `环境：${c.environment}`]
     .filter(Boolean)
     .join('｜');
   if (envBits) lines.push(envBits);
   if (c.problem) lines.push(`现象：${c.problem}`);
   if (c.rootCause) lines.push(`根因：${c.rootCause}`);
-  lines.push(`最终解决：${c.finalFix}`);
+  lines.push(`${finalFixLabel(c.outcome)}：${c.finalFix}`);
   lines.push(`结果：${OUTCOME_LABEL[c.outcome] || c.outcome}`);
   if (c.notes) lines.push(`注意：${c.notes}`);
   if (c.tags?.length) lines.push(`标签：${c.tags.join(' ')}`);
@@ -90,7 +148,14 @@ export function caseDisplayName(c: CaseRecord): string {
   return `案例 · ${c.title || '(未命名)'}`;
 }
 
-/** 只把「已验证」的案例交出去建索引 —— 门禁在此处落地，只此一处 */
+/**
+ * 只把「已验证」的案例交出去建索引 —— 门禁在此处落地，只此一处。
+ *
+ * ⚠️ 失败案例【也进】：它照样是用户亲手记录的事实，只是价值在「此路不通」。
+ *    区分「能不能照做」的职责在 caseToText 的头部与系统提示词里，不在这里 ——
+ *    在这里把失败案例滤掉，等于让用户白记了它（而且他下次还会再试一遍，正是失败记录
+ *    本该拦住的那件事）。
+ */
 export function indexableCases(all: CaseRecord[]): CaseRecord[] {
   return (all || []).filter((c) => c && c.verified && !!c.finalFix);
 }
@@ -166,7 +231,7 @@ export function casesToMarkdown(list: CaseRecord[]): string {
     if (c.environment) lines.push(`- 环境：${c.environment}`);
     if (c.problem) lines.push(`- 问题 / 现象：${c.problem}`);
     if (c.rootCause) lines.push(`- 根因：${c.rootCause}`);
-    lines.push(`- 最终解决：${c.finalFix}`);
+    lines.push(`- ${finalFixLabel(c.outcome)}：${c.finalFix}`);
     if (c.notes) lines.push(`- 注意：${c.notes}`);
     if (c.tags?.length) lines.push(`- 标签：${c.tags.join('、')}`);
     lines.push(`- 记录时间：${(c.occurredAt || c.createdAt || '').slice(0, 10)}`);
@@ -182,10 +247,15 @@ export function parseTags(s: string): string[] {
 
 /** 校验记录表单。返回第一条错误（null = 通过）。必填只有两项：最终解决 + 结果 */
 export function validateCaseInput(input: Partial<CaseInput>): string | null {
-  if (!(input.finalFix || '').trim()) return '请填写「最终怎么解决的」—— 这是案例最重要的字段';
+  // 提示语按结果分档：失败案例的必填项不是「怎么解决的」，而是「试了什么」
+  if (!(input.finalFix || '').trim()) {
+    return input.outcome === 'fail'
+      ? '请填写「试过什么、后来怎样」—— 失败记录也有用，它拦住的是一次重复的失败'
+      : '请填写「最终怎么解决的」—— 这是案例最重要的字段';
+  }
   if (!input.outcome) return '请选择结果（成功 / 部分成功 / 失败）';
   if (!OUTCOMES.includes(input.outcome)) return '结果取值不合法';
-  if ((input.finalFix || '').length > 8000) return '「最终解决」过长（上限 8000 字）';
+  if ((input.finalFix || '').length > 8000) return `「${finalFixLabel(input.outcome)}」过长（上限 8000 字）`;
   return null;
 }
 
