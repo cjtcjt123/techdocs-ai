@@ -4,11 +4,11 @@ import { colors, mono, radius, space } from '../theme';
 import Button from '../components/Button';
 import SourceCard from '../components/SourceCard';
 import ComplianceTable from '../components/ComplianceTable';
-import RecordCaseModal from '../components/RecordCaseModal';
-import type { CasePrefill } from '../components/RecordCaseModal';
+import CaseFormModal from '../components/CaseFormModal';
+import type { CasePrefill } from '../components/CaseFormModal';
 import { useStore } from '../store';
 import { Attachment, Message, Conversation, ComplianceResult, Quote } from '../types';
-import { complianceToCsv, convToMarkdown, shareText } from '../lib/export';
+import { complianceToFormat, convToMarkdown, shareText } from '../lib/export';
 import { draftFromTurn } from '../lib/cases';
 
 export default function ChatScreen() {
@@ -212,11 +212,16 @@ export default function ChatScreen() {
                 const withComp = messages.filter((m) => m.compliance);
                 if (!withComp.length) { setExportMsg('本会话还没有符合性检查结果。'); return; }
                 setExportMsg('');
-                const csv = withComp.map((m) => complianceToCsv(m.compliance as ComplianceResult)).join('\n\n');
-                setExportState({ title: `符合性检查-${convTitle}`, text: csv });
+                // 按「我的 → 更多设置 → 导出格式」走，不再写死 CSV
+                const text = withComp
+                  .map((m) => complianceToFormat(m.compliance as ComplianceResult, settings.exportFormat).text)
+                  .join('\n\n');
+                setExportState({ title: `符合性检查-${convTitle}`, text });
               }}
             >
-              <Text style={styles.exportBtnText}>⬇ 导出检查结果（CSV）</Text>
+              <Text style={styles.exportBtnText}>
+                ⬇ 导出检查结果（{settings.exportFormat === 'markdown' ? 'Markdown 表' : 'CSV'}）
+              </Text>
             </Pressable>
           </View>
           {!!exportMsg && <Text style={styles.convEmpty}>{exportMsg}</Text>}
@@ -372,7 +377,7 @@ export default function ChatScreen() {
         </View>
       )}
       {/* 记录解决过程：把这一轮变成一张经验卡片 */}
-      <RecordCaseModal
+      <CaseFormModal
         visible={!!recordFor}
         prefill={recordFor || {}}
         onClose={() => setRecordFor(null)}

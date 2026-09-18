@@ -1,16 +1,20 @@
-// 记录解决过程（经验库入口）—— 问答页底部弹出的记录表单
+// 案例表单（经验库的写入口）—— 新增与编辑共用一份表单
 //
-// 设计取舍：一份表单同时承担「成功记录」与「失败记录」，不拆成两个按钮。
-// 因为失败案例同样有价值（失败只是「在当前条件下不成立」的假设），
-// 而用户实操完只想点一个地方，多点一次就会少记一半。
+// 设计取舍：
+//  ① 一份表单同时承担「成功记录」与「失败记录」，不拆成两个按钮。失败案例同样有价值
+//     （失败只是「在当前条件下不成立」），而用户实操完只想点一个地方，多点一次就会少记一半。
+//  ② 新增与编辑共用，而不是编辑另写一份：字段完全一样，拆开写迟早分叉，
+//     分叉的症状是「编辑后某个字段莫名清空了」—— 且只在编辑路径上出现，很难发现。
+//  ③ 文件名从 RecordCaseModal 改成 CaseFormModal：它已经不只负责「记录」了，
+//     名字与职责不符是下一个改这份代码的人会踩的坑。
 import React, { useEffect, useState } from 'react';
 import {
-  Modal, View, Text, TextInput, ScrollView, StyleSheet, Pressable,
+  Modal, View, Text, TextInput, ScrollView, StyleSheet, Pressable, Switch,
   KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { colors, mono, radius, space, verdictColor } from '../theme';
 import { useStore } from '../store';
-import { CaseInput, CaseOutcome } from '../types';
+import { CaseInput, CaseOutcome, CaseRecord } from '../types';
 import {
   OUTCOMES, OUTCOME_LABEL, OUTCOME_VERDICT, parseTags, validateCaseInput,
 } from '../lib/cases';
@@ -25,15 +29,21 @@ export interface CasePrefill {
   msgId?: string;
 }
 
-export default function RecordCaseModal({
-  visible, prefill, onClose, onSaved,
+export default function CaseFormModal({
+  visible, prefill, editing, onClose, onSaved,
 }: {
   visible: boolean;
-  prefill: CasePrefill;
+  /** 从某轮问答起草（新增时用） */
+  prefill?: CasePrefill;
+  /** 传了就是编辑这条，否则新建 */
+  editing?: CaseRecord | null;
   onClose: () => void;
   onSaved: (title: string) => void;
 }) {
   const recordCase = useStore((s) => s.recordCase);
+  const updateCase = useStore((s) => s.updateCase);
+  const documents = useStore((s) => s.documents);
+  const p = prefill || {};
 
   const [outcome, setOutcome] = useState<CaseOutcome>('success');
   const [finalFix, setFinalFix] = useState('');
@@ -44,26 +54,46 @@ export default function RecordCaseModal({
   const [rootCause, setRootCause] = useState('');
   const [notes, setNotes] = useState('');
   const [tagsText, setTagsText] = useState('');
+  const [verified, setVerified] = useState(true);
   const [more, setMore] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // 每次打开都从这一轮问答重新起草，避免带上上一次的残留
+  const isEdit = !!editing;
+
+  // 每次打开重新填：编辑时用这条案例的现值，新建时用本轮问答起草的内容。
+  // 不这么做就会带上上一次的残留 —— 那是「改了 A 案例，结果 B 案例的字段被覆盖」的源头。
   useEffect(() => {
     if (!visible) return;
-    setOutcome('success');
-    setFinalFix('');
-    setTitle(prefill.title || '');
-    setProblem(prefill.problem || '');
-    setProduct('');
-    setEnvironment('');
-    setRootCause('');
-    setNotes('');
-    setTagsText('');
-    setMore(false);
+    if (editing) {
+      setOutcome(editing.outcome);
+      setFinalFix(editing.finalFix || '');
+      setTitle(editing.title || '');
+      setProblem(editing.problem || '');
+      setProduct(editing.product || '');
+      setEnvironment(editing.environment || '');
+      setRootCause(editing.rootCause || '');
+      setNotes(editing.notes || '');
+      setTagsText((editing.tags || []).join(' '));
+      setVerified(editing.verified !== false);
+      // 有补充内容就直接展开，省得用户以为字段丢了
+      setMore(!!(editing.product || editing.environment || editing.rootCause || editing.notes || editing.tags?.length));
+    } else {
+      setOutcome('success');
+      setFinalFix('');
+      setTitle(p.title || '');
+      setProblem(p.problem || '');
+      setProduct('');
+      setEnvironment('');
+      setRootCause('');
+      setNotes('');
+      setTagsText('');
+      setVerified(true);
+      setMore(false);
+    }
     setErr(null);
     setBusy(false);
-  }, [visible]);
+  }, [visible, editing]);
 
   const save = async () => {
     const input: CaseInput = {
@@ -76,20 +106,26 @@ export default function RecordCaseModal({
       outcome,
       notes: notes.trim() || undefined,
       tags: parseTags(tagsText),
-      aiAdvice: prefill.aiAdvice,
-      docIds: prefill.docIds?.length ? prefill.docIds : undefined,
-      convId: prefill.convId,
-      msgId: prefill.msgId,
+      verified,
+      aiAdvice: isEdit ? undefined : p.aiAdvice, // undefined = 编辑时保留原值（见 store.updateCase）
+      docIds: isEdit ? undefined : (p.docIds?.length ? p.docIds : undefined),
+      convId: isEdit ? undefined : p.convId,
+      msgId: isEdit ? undefined : p.msgId,
     };
     const bad = validateCaseInput(input);
     if (bad) { setErr(bad); return; }
     setBusy(true);
-    const saved = await recordCase(input);
+    const saved = editing ? await updateCase(editing.id, input) : await recordCase(input);
     setBusy(false);
     if (!saved) { setErr('保存失败，请重试'); return; }
     onSaved(saved.title);
     onClose();
   };
+
+  // 关联文档：编辑时库里存的是 docIds，这里把名字查回来显示（读不到就当它已被删）
+  const linkedDocNames = isEdit
+    ? (editing?.docIds || []).map((id) => documents.find((d) => d.id === id)?.name).filter(Boolean) as string[]
+    : (p.docNames || []);
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
@@ -98,9 +134,11 @@ export default function RecordCaseModal({
           <View style={styles.sheet}>
             <View style={styles.sheetHead}>
               <View style={{ flex: 1, minWidth: 0 }}>
-                <Text style={styles.sheetTitle}>记录这次怎么解决的</Text>
+                <Text style={styles.sheetTitle}>{isEdit ? '编辑案例' : '记录这次怎么解决的'}</Text>
                 <Text style={styles.sheetSub}>
-                  存进经验库后，下次问类似问题会被优先检索到
+                  {isEdit
+                    ? '改完立刻生效 —— 下次问类似问题会用到新的内容'
+                    : '存进经验库后，下次问类似问题会被优先检索到'}
                 </Text>
               </View>
               <Pressable hitSlop={10} onPress={onClose}>
@@ -181,29 +219,45 @@ export default function RecordCaseModal({
                   <TextInput style={styles.input} value={tagsText} onChangeText={setTagsText}
                     placeholder="空格或逗号分隔，例如：气泡 工艺 CY1578" placeholderTextColor={colors.faint} />
 
-                  {!!prefill.aiAdvice && (
+                  {!isEdit && !!p.aiAdvice && (
                     <View style={styles.advice}>
                       <Text style={styles.adviceHead}>当时 AI 的建议（随案例一起存，便于日后回看）</Text>
-                      <Text style={styles.adviceText} numberOfLines={4}>{prefill.aiAdvice}</Text>
+                      <Text style={styles.adviceText} numberOfLines={4}>{p.aiAdvice}</Text>
                     </View>
                   )}
-                  {!!prefill.docNames?.length && (
+                  {!!linkedDocNames.length && (
                     <View style={styles.advice}>
                       <Text style={styles.adviceHead}>关联的原始文档</Text>
-                      <Text style={styles.adviceText}>{prefill.docNames.join('、')}</Text>
+                      <Text style={styles.adviceText}>{linkedDocNames.join('、')}</Text>
                     </View>
                   )}
                 </View>
               )}
 
+              {/* 参与检索的开关：不藏在补充项里，因为它是唯一影响「之后每次回答」的字段 */}
+              <View style={styles.toggleRow}>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={styles.toggleLabel}>参与问答检索</Text>
+                  <Text style={styles.toggleHint}>
+                    {verified
+                      ? '下次问类似问题时，这条会被优先检索到。'
+                      : '关掉 = 先存着但不用它影响回答（草稿）。记录仍在库里，随时可以再打开。'}
+                  </Text>
+                </View>
+                <Switch value={verified} onValueChange={setVerified} />
+              </View>
+
               {err ? <Text style={styles.err}>{err}</Text> : null}
 
               <Pressable style={[styles.save, busy && { opacity: 0.6 }]} disabled={busy} onPress={save}>
-                <Text style={styles.saveText}>{busy ? '保存中…' : '保存到经验库'}</Text>
+                <Text style={styles.saveText}>
+                  {busy ? '保存中…' : isEdit ? '保存修改' : '保存到经验库'}
+                </Text>
               </Pressable>
               <Text style={styles.footNote}>
-                只有「解决了」的案例才会参与问答检索；草稿永远不进检索池 ——
-                否则一条错的记录会戴着「你亲手验证过」的帽子污染之后的每一次回答。
+                门禁：只有「参与问答检索」打开的案例才会进检索池。
+                关掉的多半是还没验证过的记录 —— 一条错的记录若戴着「你亲手验证过」的帽子，
+                会污染之后的每一次回答。
               </Text>
             </ScrollView>
           </View>
@@ -252,6 +306,12 @@ const styles = StyleSheet.create({
   },
   adviceHead: { fontSize: 11, fontWeight: '700', color: colors.muted, marginBottom: 4 },
   adviceText: { fontSize: 12, color: colors.text2, lineHeight: 18 },
+  toggleRow: {
+    flexDirection: 'row', alignItems: 'center', gap: space.s2,
+    marginTop: space.s3, paddingTop: space.s2, borderTopWidth: 1, borderTopColor: colors.borderSoft,
+  },
+  toggleLabel: { fontSize: 13.5, fontWeight: '700', color: colors.text },
+  toggleHint: { fontSize: 11, color: colors.muted, marginTop: 3, lineHeight: 16 },
   err: { marginTop: space.s2, fontSize: 12, color: colors.red, fontWeight: '600' },
   save: {
     marginTop: space.s3, backgroundColor: colors.primary, borderRadius: radius.md,

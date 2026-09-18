@@ -122,6 +122,59 @@ export function caseTagCounts(all: CaseRecord[]): Array<{ tag: string; n: number
   return [...m.entries()].map(([tag, n]) => ({ tag, n })).sort((a, b) => b.n - a.n || (a.tag < b.tag ? -1 : 1));
 }
 
+export interface CaseFilter {
+  /** 按结果筛；'all' 或省略 = 不筛 */
+  outcome?: CaseOutcome | 'all';
+  /** 只看「未参与检索」的那些（草稿 / 已被手动停用的） */
+  onlyUnverified?: boolean;
+  /** 关键词：标题 / 现象 / 根因 / 最终解决 / 标签，任一命中即可 */
+  q?: string;
+}
+
+/**
+ * 经验库列表的筛选。抽成纯函数是为了能离线测 —— 它决定「用户以为筛掉了、其实还在」，
+ * 而这种错误在界面上完全看不出来（列表看着变短了，但你不知道少的是哪条）。
+ */
+export function filterCases(all: CaseRecord[], f: CaseFilter): CaseRecord[] {
+  const q = (f?.q || '').trim().toLowerCase();
+  return (all || []).filter((c) => {
+    if (f?.outcome && f.outcome !== 'all' && c.outcome !== f.outcome) return false;
+    if (f?.onlyUnverified && c.verified) return false;
+    if (!q) return true;
+    const hay = [c.title, c.problem, c.rootCause, c.finalFix, c.product, c.environment, c.notes, (c.tags || []).join(' ')]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    return hay.includes(q);
+  });
+}
+
+/**
+ * 经验库整库导出为 Markdown。
+ *
+ * 与 caseToText 的区别：那个是喂给检索的语料（去掉空行、字段顺序按召回效果排），
+ * 这个是给人看的档案 —— 保留空行与列表结构，且带上「未参与检索」的标记，
+ * 否则导出后根本分不清哪条是自己已经在用的。
+ */
+export function casesToMarkdown(list: CaseRecord[]): string {
+  const lines: string[] = [`# 经验库（${(list || []).length} 条）`, '', `> 导出时间：${new Date().toLocaleString()}`, ''];
+  (list || []).forEach((c, i) => {
+    lines.push(`## ${i + 1}. ${c.title || '（未命名案例）'}`);
+    lines.push('');
+    lines.push(`- 结果：${OUTCOME_LABEL[c.outcome] || c.outcome}${c.verified ? '' : '（未参与检索）'}`);
+    if (c.product) lines.push(`- 产品 / 型号：${c.product}`);
+    if (c.environment) lines.push(`- 环境：${c.environment}`);
+    if (c.problem) lines.push(`- 问题 / 现象：${c.problem}`);
+    if (c.rootCause) lines.push(`- 根因：${c.rootCause}`);
+    lines.push(`- 最终解决：${c.finalFix}`);
+    if (c.notes) lines.push(`- 注意：${c.notes}`);
+    if (c.tags?.length) lines.push(`- 标签：${c.tags.join('、')}`);
+    lines.push(`- 记录时间：${(c.occurredAt || c.createdAt || '').slice(0, 10)}`);
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+
 /** 把逗号/顿号/空格分隔的标签串拆成数组（表单里就是一个输入框） */
 export function parseTags(s: string): string[] {
   return [...new Set((s || '').split(/[,，、\s]+/).map((x) => x.trim()).filter(Boolean))];
