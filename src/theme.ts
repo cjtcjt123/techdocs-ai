@@ -41,6 +41,12 @@ export const colors = {
   kwSoft: '#efeeff',
   sem: '#1f8a4c',
   semSoft: '#eef7f1',
+
+  // 案例（个人经验库）徽章 —— 用深色而不是新色相：
+  // 它必须比 KW / SEM 更抢眼（这是你亲手验证过的东西），但不能冒充语义色
+  // （绿=成功、红=失败，一屏里同色只能表示一种意思）。
+  caseInk: '#2c313c',
+  caseSoft: '#eceef3',
 };
 
 export const radius = { sm: 10, md: 12, lg: 14, xl: 18, xxl: 20, pill: 999 };

@@ -12,9 +12,11 @@
  */
 import { KeywordIndex, tokenize } from './keyword';
 import type { KeywordHit } from './keyword';
-import { getAllChunksForIndex, getDocuments, getEmbeddings } from './storage';
+import { getAllChunksForIndex, getDocuments, getEmbeddings, listVerifiedCases } from './storage';
 import { cosine, embedTexts } from './embedding';
 import type { EmbeddingConfig } from './settings';
+import { caseCorpusRow, caseDisplayName, caseDocId, isCaseDocId, indexableCases } from './cases';
+import type { CaseRecord } from '../types';
 import type { SearchResult } from '../types';
 
 interface CorpusRow {
@@ -28,6 +30,10 @@ let cachedIndex: KeywordIndex | null = null;
 let cachedRows: CorpusRow[] = [];
 let cachedFingerprint = '';
 let cachedVectors: Array<{ chunkId: string; docId: string; vec: Float32Array }> | null = null;
+// 经验库案例（只含「已验证」的）。刻意【不做跨次缓存】：
+// 案例是用户随时会写的活数据，而「记了却搜不到」这个 bug 极难被发现（还以为是自己没写清）。
+// 它每次问答只被读两次（建索引 + 回填名字），量级是几十行的小表，代价可忽略。
+let cachedCases: CaseRecord[] = [];
 
 function fingerprintOf(rows: CorpusRow[]): string {
   let total = 0;
@@ -41,9 +47,31 @@ async function loadCorpus(): Promise<CorpusRow[]> {
   return cachedRows;
 }
 
-/** 取（必要时重建）关键词索引。语料指纹变了就重建。 */
+/**
+ * 取经验库案例（已验证的）。读失败不抛 —— 经验库坏了不该让整个问答不可用。
+ * 门禁（draft 不进召回池）在 indexableCases 里落地，只此一处。
+ */
+async function loadCaseCorpus(): Promise<CaseRecord[]> {
+  try {
+    cachedCases = indexableCases(await listVerifiedCases());
+  } catch (e) {
+    console.warn('[检索] 经验库读取失败，本次问答不含案例：', (e as any)?.message || e);
+    cachedCases = [];
+  }
+  return cachedCases;
+}
+
+/**
+ * 取（必要时重建）关键词索引。语料指纹变了就重建。
+ *
+ * 经验库案例以 `case:<id>` 的虚拟 docId 拼进同一份语料 —— 于是：
+ *   · 案例走的是同一套 BM25 与同一套缓存，零新增检索代码
+ *   · 案例计入指纹（块数:总字数）→ 记一条新案例会自动触发重建，不需要任何额外的失效调用
+ */
 export async function getKeywordIndex(): Promise<KeywordIndex> {
-  const rows = (await getAllChunksForIndex()) as CorpusRow[];
+  const docRows = (await getAllChunksForIndex()) as CorpusRow[];
+  const cases = await loadCaseCorpus();
+  const rows: CorpusRow[] = [...docRows, ...cases.map(caseCorpusRow)];
   const fp = fingerprintOf(rows);
   if (cachedIndex && cachedFingerprint === fp) return cachedIndex;
   cachedRows = rows;
@@ -66,6 +94,7 @@ export function invalidateRetrievalIndex() {
   cachedRows = [];
   cachedFingerprint = '';
   cachedVectors = null;
+  cachedCases = [];
 }
 
 async function getVectorIndex() {
@@ -74,15 +103,22 @@ async function getVectorIndex() {
   return cachedVectors;
 }
 
+/** 文档名 / 案例名实时回填。名字刻意不进缓存 —— 改名要立刻生效 */
 async function docNameMap(): Promise<Map<string, string>> {
   const docs = await getDocuments();
-  return new Map(docs.map((d) => [d.id, d.name]));
+  const m = new Map(docs.map((d) => [d.id, d.name]));
+  for (const c of await loadCaseCorpus()) m.set(caseDocId(c.id), caseDisplayName(c));
+  return m;
 }
 
 /**
  * 关键词检索（BM25）。签名与旧的 storage.searchChunks 一致，调用方无感。
  *   · query   查询原文，支持中文整句（内部自动分词）
  *   · docIds  限定检索范围；显式传空数组 = 范围为空 = 无结果
+ *
+ * 范围里会额外并入案例的虚拟 id：「仅钉住文档 / 仅某标签」限制的是【资料】，
+ * 而案例是用户自己的实测经验 —— 范围收窄时恰恰最该看到它。
+ * 被静默排除的症状是「案例记了却没生效」，非常难查，所以这里显式放开。
  */
 export async function searchChunks(
   query: string,
@@ -91,7 +127,8 @@ export async function searchChunks(
 ): Promise<KeywordHit[]> {
   if (!(query || '').trim()) return [];
   const idx = await getKeywordIndex();
-  const hits = idx.search(query, limit, opts?.docIds);
+  const scope = opts?.docIds ? [...opts.docIds, ...cachedCases.map((c) => caseDocId(c.id))] : undefined;
+  const hits = idx.search(query, limit, scope);
   if (!hits.length) return [];
   const names = await docNameMap();
   for (const h of hits) h.docName = names.get(h.docId) || '(已删除)';
@@ -178,14 +215,17 @@ export async function searchAll(query: string, limit = 30): Promise<SearchResult
     });
   }
 
-  // 2) 正文片段命中
+  // 2) 正文片段命中 + 经验库案例命中
+  //    案例就在同一份语料里（虚拟 docId = case:<id>），所以这里只需按 id 前缀分个类，
+  //    不需要为「搜案例」再写一套检索。
   const chunkHits = await searchChunks(query, limit);
   for (const c of chunkHits) {
+    const isCase = isCaseDocId(c.docId);
     out.push({
-      kind: 'chunk',
+      kind: isCase ? 'case' : 'chunk',
       docId: c.docId,
       docName: c.docName,
-      pageNo: c.pageNo,
+      pageNo: isCase ? undefined : c.pageNo,
       snippet: c.content,
       score: c.score,
     });

@@ -4,9 +4,12 @@ import { colors, mono, radius, space } from '../theme';
 import Button from '../components/Button';
 import SourceCard from '../components/SourceCard';
 import ComplianceTable from '../components/ComplianceTable';
+import RecordCaseModal from '../components/RecordCaseModal';
+import type { CasePrefill } from '../components/RecordCaseModal';
 import { useStore } from '../store';
 import { Attachment, Message, Conversation, ComplianceResult, Quote } from '../types';
 import { complianceToCsv, convToMarkdown, shareText } from '../lib/export';
+import { draftFromTurn } from '../lib/cases';
 
 export default function ChatScreen() {
   const {
@@ -28,6 +31,9 @@ export default function ChatScreen() {
   // 导出预览
   const [exportState, setExportState] = useState<{ title: string; text: string } | null>(null);
   const [exportMsg, setExportMsg] = useState('');
+  // 「记录解决过程」表单的预填内容（null = 未打开）
+  const [recordFor, setRecordFor] = useState<CasePrefill | null>(null);
+  const [toast, setToast] = useState('');
   const scrollRef = useRef<ScrollView>(null);
 
   const retrieval = settings.retrieval ?? { topK: 8, onlyPinned: false, tags: [] };
@@ -95,6 +101,34 @@ export default function ChatScreen() {
     if (mode === 'compliance') runCompliance(payload, att.length ? att : undefined);
     else sendMessage(payload, att.length ? att : undefined);
   };
+
+  // 打开「记录解决过程」。预填是纯规则拼装，不调模型：
+  // 唯一真正有价值的字段（最终怎么解决的）只能由人填，模型编不出来；
+  // 而问题与 AI 建议本来就在手上，直接带上即可 —— 少一次调用、少一段要改的文字。
+  const openRecord = (idx: number) => {
+    const ai = messages[idx];
+    if (!ai) return;
+    const prevUser = [...messages.slice(0, idx)].reverse().find((m) => m.role === 'user');
+    const q = (prevUser?.content || '').replace(/^【需求符合性检查】/, '');
+    const d = draftFromTurn(q, ai.content);
+    const docs = (ai.quotes || []).filter((x) => x.kind !== 'case');
+    setRecordFor({
+      title: d.title,
+      problem: d.problem,
+      aiAdvice: d.aiAdvice,
+      docIds: [...new Set(docs.map((x) => x.docId))],
+      docNames: [...new Set(docs.map((x) => x.docName))],
+      convId: currentConvId || undefined,
+      msgId: ai.id,
+    });
+  };
+
+  // 保存成功的提示：3 秒后自己消失，不需要用户点确认
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(''), 3200);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   return (
     <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
@@ -253,7 +287,7 @@ export default function ChatScreen() {
       {/* 检索步骤条：答完留在页面上，随时能回看「这次是怎么找到的」 */}
       {messages.length > 0 && (thinking || lastRetrieval) ? (
         <RetrievalSteps
-          s={lastRetrieval ?? { total: 0, hits: 0, kw: 0, sem: 0, pinned: 0 }}
+          s={lastRetrieval ?? { total: 0, hits: 0, kw: 0, sem: 0, pinned: 0, cases: 0 }}
         />
       ) : null}
 
@@ -264,7 +298,15 @@ export default function ChatScreen() {
             <Text style={styles.welcomeHint}>试试：「只给我 CY1578 的耐温值」「提取配置步骤」，或贴一段技术要求做「需求符合性检查」。</Text>
           </View>
         )}
-        {messages.map((m) => <Bubble key={m.id} m={m} />)}
+        {messages.map((m, i) => (
+          <Bubble
+            key={m.id}
+            m={m}
+            // 报错气泡不给记录入口：没解决问题时能记的只有「未解决」，
+            // 而失败记录的价值在于「换条件再试」，不是把一次网络错误记成案例
+            onRecord={m.role === 'ai' && !m.content.startsWith('⚠️') ? () => openRecord(i) : undefined}
+          />
+        ))}
         {thinking && <View style={[styles.bubble, { alignSelf: 'flex-start', backgroundColor: colors.primarySoft }]}><Text style={{ color: colors.text }}>思考中…</Text></View>}
       </ScrollView>
 
@@ -329,6 +371,19 @@ export default function ChatScreen() {
           </View>
         </View>
       )}
+      {/* 记录解决过程：把这一轮变成一张经验卡片 */}
+      <RecordCaseModal
+        visible={!!recordFor}
+        prefill={recordFor || {}}
+        onClose={() => setRecordFor(null)}
+        onSaved={(t) => setToast(`已存入经验库：${t}`)}
+      />
+
+      {!!toast && (
+        <View style={styles.toast} pointerEvents="none">
+          <Text style={styles.toastText}>📝 {toast}</Text>
+        </View>
+      )}
     </KeyboardAvoidingView>
   );
 }
@@ -341,9 +396,10 @@ function Chip({ label, on, onPress }: { label: string; on: boolean; onPress: () 
   );
 }
 
-function Bubble({ m }: { m: Message }) {
+function Bubble({ m, onRecord }: { m: Message; onRecord?: () => void }) {
   const isUser = m.role === 'user';
   const quotes = m.quotes;
+  const caseCount = (quotes || []).filter((q) => q.kind === 'case').length;
   return (
     <View style={[styles.row, isUser ? styles.rowUser : styles.rowAi]}>
       <View style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAi]}>
@@ -357,11 +413,20 @@ function Bubble({ m }: { m: Message }) {
           <View style={{ marginTop: space.s1 }}>
             <Text style={styles.quoteHead}>
               来源 · {quotes.length}
+              {caseCount > 0 ? `（含经验案例 ${caseCount}）` : ''}
               {quotes.some((q) => q.score != null) ? ' · 按融合得分排序' : ''}
             </Text>
             {quotes.map((q, i) => <SourceCard key={i} quote={q} index={i} />)}
           </View>
         )}
+        {/* 记录入口挂在回答下方（而不是页面底部）：用户刚照着做完，
+            视线就在这条回答上，此时「记下来」的转化率最高 */}
+        {!isUser && onRecord ? (
+          <Pressable onPress={onRecord} style={styles.recBtn}>
+            <Text style={styles.recText}>📝 记录怎么解决的</Text>
+            <Text style={styles.recHint}>存进经验库，下次优先命中</Text>
+          </Pressable>
+        ) : null}
       </View>
     </View>
   );
@@ -399,11 +464,15 @@ function RetrievalSteps({ s }: { s: NonNullable<ReturnType<typeof useStore.getSt
         <Text style={styles.stepsT1}>
           已检索 {s.total} 块 · 命中 {s.hits} 处
         </Text>
-        <Text style={styles.stepsN}>{dual ? `关键词 ${s.kw} + 语义 ${s.sem}` : `关键词 ${s.kw}`}</Text>
+        <Text style={styles.stepsN}>
+          {s.cases ? `案例 ${s.cases} · ` : ''}
+          {dual ? `关键词 ${s.kw} + 语义 ${s.sem}` : `关键词 ${s.kw}`}
+        </Text>
       </View>
       <Text style={styles.stepsL2}>
         BM25 命中 {s.kw}
         {dual ? ` · 语义命中 ${s.sem}` : ' · 未配嵌入服务，仅关键词'}
+        {s.cases ? ` · 经验库命中 ${s.cases}` : ''}
         {' · RRF 融合排序'}
         {s.pinned ? ` · 钉住 ${s.pinned} 条` : ''}
       </Text>
@@ -413,6 +482,29 @@ function RetrievalSteps({ s }: { s: NonNullable<ReturnType<typeof useStore.getSt
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
+  // 记录入口：用「案例」配色（深底），与正文的浅紫来源卡区分开
+  recBtn: {
+    marginTop: 9,
+    alignSelf: 'flex-start',
+    backgroundColor: colors.caseSoft,
+    borderRadius: radius.md,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  recText: { fontSize: 12, fontWeight: '700', color: colors.caseInk },
+  recHint: { fontSize: 10.5, color: colors.muted, marginTop: 2 },
+  // 保存成功的轻提示：不需要点确认，3 秒自散
+  toast: {
+    position: 'absolute',
+    left: space.s3,
+    right: space.s3,
+    bottom: 96,
+    backgroundColor: colors.caseInk,
+    borderRadius: radius.md,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  toastText: { color: '#fff', fontSize: 12.5, fontWeight: '600' },
   convBar: { flexDirection: 'row', alignItems: 'center', gap: space.s2, paddingHorizontal: space.s3, paddingVertical: space.s2, backgroundColor: colors.surface, borderBottomWidth: 1, borderBottomColor: colors.border },
   convPick: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: colors.background, borderRadius: radius.sm, paddingVertical: 7, paddingHorizontal: space.s2 },
   convTitle: { flex: 1, fontSize: 13, fontWeight: '600', color: colors.text },

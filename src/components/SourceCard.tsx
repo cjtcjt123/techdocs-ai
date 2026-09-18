@@ -8,6 +8,9 @@ import type { Quote } from '../types';
 
 function badgeOf(q: Quote): { label: string; fg: string; bg: string } {
   const from = q.from || [];
+  // 案例优先于其它徽章：这一条来自个人经验库、用户亲手验证过 ——
+  // 回答里最该被看见的就是「这条不是文档说的，是你自己实测出来的」。
+  if (q.kind === 'case') return { label: '案例', fg: '#fff', bg: colors.caseInk };
   if (q.pinned) return { label: '钉住', fg: colors.muted, bg: colors.borderSoft };
   const kw = from.includes('keyword');
   const sem = from.includes('semantic');
@@ -29,7 +32,8 @@ export default function SourceCard({ quote, index }: { quote: Quote; index: numb
       <View style={styles.head}>
         <Text style={styles.no}>{index + 1}</Text>
         <Text style={styles.fn} numberOfLines={1}>
-          {quote.docName}
+          {/* 案例名字里自带「案例 · 」前缀（给全局搜索用），这里有徽章了，去掉避免重复 */}
+          {quote.kind === 'case' ? (quote.docName || '').replace(/^案例 · /, '') : quote.docName}
         </Text>
         {b.label ? (
           <View style={[styles.bdg, { backgroundColor: b.bg }]}>

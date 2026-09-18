@@ -6,6 +6,7 @@ import { secureGet, secureSet } from './lib/secure';
 import {
   Document, Conversation, Message, ModelConfig, DataStrategy,
   Attachment, ComplianceResult, NasConnection, RetrievalConfig, SearchResult,
+  CaseRecord, CaseInput,
 } from './types';
 import { listDir, downloadText, type NasEntry } from './lib/nas-webdav';
 import {
@@ -13,8 +14,10 @@ import {
   deleteDocument, renameDocument, kvGet, kvSet,
   setDocumentPinned, setDocumentTags,
   getAllChunksForIndex, putEmbeddings, clearEmbeddings, embeddingStats,
+  listCases, saveCase as saveCaseRow, deleteCase as deleteCaseRow,
 } from './lib/storage';
 import { searchAll, invalidateRetrievalIndex } from './lib/retrieval';
+import { sortCases, validateCaseInput } from './lib/cases';
 import { embedTexts, resetEmbeddingProbe } from './lib/embedding';
 import { parseAsset, extToType, chunkText } from './lib/parser';
 import type { ParseContext } from './lib/parser';
@@ -79,7 +82,7 @@ function resolveScope(s: { documents: Document[]; settings: AppSettings }) {
   };
 }
 
-// 一次检索的「交代」：检索了多少块、命中几条、关键词与语义各贡献几条、钉住几条。
+// 一次检索的「交代」：检索了多少块、命中几条、关键词/语义/案例各贡献几条、钉住几条。
 // 步骤条要显示的就是它 —— 让「思考中」这段时间有个可解释的过程，而不是一个转圈。
 export interface RetrievalStats {
   total: number;
@@ -87,6 +90,7 @@ export interface RetrievalStats {
   kw: number;
   sem: number;
   pinned: number;
+  cases: number; // 命中几条「个人经验库」案例（要不要信这条回答，这一格很关键）
 }
 
 function summarizeHits(hits: Hit[], total: number): RetrievalStats {
@@ -96,6 +100,7 @@ function summarizeHits(hits: Hit[], total: number): RetrievalStats {
     kw: hits.filter((h) => h.from?.includes('keyword')).length,
     sem: hits.filter((h) => h.from?.includes('semantic')).length,
     pinned: hits.filter((h) => h.pinned).length,
+    cases: hits.filter((h) => h.kind === 'case').length,
   };
 }
 
@@ -135,6 +140,11 @@ interface State {
   compareError: string | null;
   // 最近一次检索的过程数据（问答页顶部的检索步骤条）
   lastRetrieval: RetrievalStats | null;
+  // 个人经验库：案例卡片（含未验证的草稿 —— 列表要显示全部，而检索只吃 verified）
+  cases: CaseRecord[];
+  loadCases: () => Promise<void>;
+  recordCase: (input: CaseInput) => Promise<CaseRecord | null>;
+  removeCase: (id: string) => Promise<void>;
 
   init: () => Promise<void>;
   importFiles: () => Promise<void>;
@@ -204,6 +214,7 @@ export const useStore = create<State>((set, get) => ({
   compareBusy: false,
   compareError: null,
   lastRetrieval: null,
+  cases: [],
 
   async init() {
     await initDB();
@@ -236,6 +247,65 @@ export const useStore = create<State>((set, get) => ({
       locked: !!pc, // 若已设密码，则启动即锁
     });
     void get().refreshEmbeddingStats();
+    void get().loadCases();
+  },
+
+  // ---- 个人经验库 ----
+  async loadCases() {
+    try {
+      set({ cases: sortCases(await listCases()) });
+    } catch (e: any) {
+      set({ lastError: e?.message || '经验库读取失败' });
+    }
+  },
+
+  /**
+   * 记一条案例。这是经验库【唯一的写入口】——
+   * 校验、标 verified、刷新列表、作废检索缓存四件事都收在这里。
+   * 留一个入口是有意的：以后再加写入路径，很容易漏掉「作废检索缓存」，
+   * 症状是「刚记完又问一遍，案例还是没生效」，而且看起来像检索写错了。
+   */
+  async recordCase(input) {
+    const bad = validateCaseInput(input);
+    if (bad) { set({ lastError: bad }); return null; }
+    const rec: CaseRecord = {
+      id: uid(),
+      title: (input.title || input.problem || '').trim().slice(0, 80) || '（未命名案例）',
+      problem: input.problem?.trim() || undefined,
+      product: input.product?.trim() || undefined,
+      environment: input.environment?.trim() || undefined,
+      docIds: input.docIds?.length ? input.docIds : undefined,
+      aiAdvice: input.aiAdvice || undefined,
+      rootCause: input.rootCause?.trim() || undefined,
+      finalFix: input.finalFix.trim(),
+      outcome: input.outcome,
+      notes: input.notes?.trim() || undefined,
+      tags: input.tags?.length ? input.tags : [],
+      // 用户亲手填了「最终怎么解决的」→ 直接算已验证。
+      // verified=false 的草稿位置留给将来「由 AI 起草、待用户确认」的路径。
+      verified: true,
+      occurredAt: input.occurredAt,
+      createdAt: new Date().toISOString(),
+      convId: input.convId,
+      msgId: input.msgId,
+    };
+    try {
+      await saveCaseRow(rec);
+      set({ cases: sortCases([rec, ...get().cases.filter((c) => c.id !== rec.id)]) });
+      // 语料变了必须重建检索索引。指纹机制能覆盖「新增 / 删除」（块数与总字数会变），
+      // 但覆盖不了「改一个等长的字」（30min → 40min 时指纹完全相同），所以这里显式作废。
+      invalidateRetrievalIndex();
+      return rec;
+    } catch (e: any) {
+      set({ lastError: e?.message || '案例保存失败' });
+      return null;
+    }
+  },
+
+  async removeCase(id) {
+    await deleteCaseRow(id);
+    set({ cases: get().cases.filter((c) => c.id !== id) });
+    invalidateRetrievalIndex();
   },
 
   async importFiles() {
@@ -460,7 +530,13 @@ export const useStore = create<State>((set, get) => ({
         ? '【本次附件文本】\n' + (attachments || []).filter((a) => a.text).map((a) => `《${a.name}》\n${a.text}`).join('\n\n')
         : '';
       const sys = `你是「京美AI助手」，只基于下方【可引用资料】与【本次附件】回答，每条结论尽量标注来源（如"见[来源1]"）。
-若资料中没有明确答案，必须说明"资料未提供"，严禁编造数据或参数。`;
+若资料中没有明确答案，必须说明"资料未提供"，严禁编造数据或参数。
+
+资料里有两种来源，回答时必须分清：
+· 【你已验证的经验案例】= 用户本人实操并记录过的做法，优先级最高。引用时带上记录日期，例如"根据你 08-12 的记录"；
+· 《文档名》= 原始技术资料（TDS / 规格书 / 手册），说明"理论上应当怎么做"。
+两者冲突时：必须明确指出冲突，并以案例为准（例如"手册写 40 min，你的记录是 30 min 即合格，以你的实测为准"）。
+两者都没有时，明确说明"资料未提供"，不要用常识补。`;
       const fullContext = `${sys}\n\n【可引用资料】\n${ctx}\n\n${attText}`;
       const history = toChatHistory(updated.messages);
       const messages: ChatMsg[] = [

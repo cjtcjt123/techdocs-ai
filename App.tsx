@@ -47,6 +47,9 @@ function Tabs() {
   const insets = useSafeAreaInsets();
   return (
     <Tab.Navigator
+      // 显式给 id：@react-navigation v7 的类型在没传 id 时会把 `id` 推成【必填】，
+      // 两个重载全部报 "Property 'id' is missing"。补上就恢复正常，运行时它只是导航器标识。
+      id="tabs"
       screenOptions={{
         headerStyle: { backgroundColor: colors.surface },
         headerTintColor: colors.text,
@@ -116,7 +119,7 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <NavigationContainer>
-        <Stack.Navigator>
+        <Stack.Navigator id="root">
           <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
           {/* 「我的」放在 Stack 里（不是 Tab）：4 个 Tab 才不挤，而且 push 进来自带返回箭头。
               入口在工作台顶栏的「设置」胶囊；旧的 navigate('Profile') 依旧有效（会冒泡到父 Stack）。 */}

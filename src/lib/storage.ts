@@ -1,6 +1,6 @@
 // 本地存储层（expo-sqlite）—— 文档元信息 + 文本块
 import * as SQLite from 'expo-sqlite';
-import { Document, Chunk, DocStatus, DocMeta } from '../types';
+import { Document, Chunk, DocStatus, DocMeta, CaseRecord } from '../types';
 
 const db = SQLite.openDatabaseSync('techdocs.db');
 
@@ -39,6 +39,28 @@ export async function initDB() {
       vec BLOB
     );
     CREATE INDEX IF NOT EXISTS idx_emb_doc ON embeddings(docId);
+    -- 个人经验库。新表用 CREATE TABLE IF NOT EXISTS 就够：老库没有这张表 → 这里直接建出来，
+    -- 不需要 ALTER 迁移（只有「给已有表加列」才必须显式 ALTER）。
+    CREATE TABLE IF NOT EXISTS cases (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      problem TEXT,
+      product TEXT,
+      environment TEXT,
+      docIds TEXT,
+      aiAdvice TEXT,
+      rootCause TEXT,
+      finalFix TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      notes TEXT,
+      tags TEXT,
+      verified INTEGER DEFAULT 1,
+      occurredAt TEXT,
+      createdAt TEXT NOT NULL,
+      convId TEXT,
+      msgId TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_cases_created ON cases(createdAt);
   `);
   // 老库升级：已装机用户的 documents 表没有 pinned 列，
   // CREATE TABLE IF NOT EXISTS 不会补列，必须显式 ALTER，否则读取时报 no such column 直接崩。
@@ -210,4 +232,74 @@ export async function deleteEmbeddingsByDoc(docId: string): Promise<void> {
 
 export async function clearEmbeddings(): Promise<void> {
   await db.runAsync(`DELETE FROM embeddings`);
+}
+
+// ---- 个人经验库（案例）----
+// 与 documents/chunks 并列的独立表：案例不是文档（没有文件、没有分块、没有页码），
+// 硬塞进 documents 会让「资料库列表」「解析状态」这些既有逻辑到处长 case 分支。
+const CASE_COLS =
+  'id,title,problem,product,environment,docIds,aiAdvice,rootCause,finalFix,outcome,notes,tags,verified,occurredAt,createdAt,convId,msgId';
+
+function rowToCase(r: any): CaseRecord {
+  return {
+    id: r.id,
+    title: r.title || '',
+    problem: r.problem || undefined,
+    product: r.product || undefined,
+    environment: r.environment || undefined,
+    docIds: JSON.parse(r.docIds || '[]'),
+    aiAdvice: r.aiAdvice || undefined,
+    rootCause: r.rootCause || undefined,
+    finalFix: r.finalFix || '',
+    outcome: r.outcome,
+    notes: r.notes || undefined,
+    tags: JSON.parse(r.tags || '[]'),
+    // 老行没有该列时按「已验证」处理：能写进来的案例都是用户亲手填的
+    verified: r.verified == null ? true : !!r.verified,
+    occurredAt: r.occurredAt || undefined,
+    createdAt: r.createdAt,
+    convId: r.convId || undefined,
+    msgId: r.msgId || undefined,
+  };
+}
+
+export async function listCases(): Promise<CaseRecord[]> {
+  const rows = await db.getAllAsync<any>(`SELECT ${CASE_COLS} FROM cases ORDER BY createdAt DESC`);
+  return rows.map(rowToCase);
+}
+
+/** 只取「已验证」的 —— 检索层的唯一入口，门禁（draft 不可见）在这里落地 */
+export async function listVerifiedCases(): Promise<CaseRecord[]> {
+  const rows = await db.getAllAsync<any>(
+    `SELECT ${CASE_COLS} FROM cases WHERE verified=1 AND finalFix <> '' ORDER BY createdAt DESC`
+  );
+  return rows.map(rowToCase);
+}
+
+export async function getCase(id: string): Promise<CaseRecord | null> {
+  const r = await db.getFirstAsync<any>(`SELECT ${CASE_COLS} FROM cases WHERE id=?`, [id]);
+  return r ? rowToCase(r) : null;
+}
+
+export async function saveCase(c: CaseRecord): Promise<void> {
+  await db.runAsync(
+    `INSERT OR REPLACE INTO cases (${CASE_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      c.id, c.title || '', c.problem ?? null, c.product ?? null, c.environment ?? null,
+      JSON.stringify(c.docIds || []), c.aiAdvice ?? null, c.rootCause ?? null, c.finalFix,
+      c.outcome, c.notes ?? null, JSON.stringify(c.tags || []), c.verified ? 1 : 0,
+      c.occurredAt ?? null, c.createdAt, c.convId ?? null, c.msgId ?? null,
+    ]
+  );
+}
+
+export async function deleteCase(id: string): Promise<void> {
+  await db.runAsync(`DELETE FROM cases WHERE id=?`, [id]);
+}
+
+export async function countCases(): Promise<{ total: number; verified: number }> {
+  const r = await db.getFirstAsync<any>(
+    `SELECT COUNT(*) AS total, SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END) AS verified FROM cases`
+  );
+  return { total: r?.total || 0, verified: r?.verified || 0 };
 }

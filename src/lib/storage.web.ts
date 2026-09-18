@@ -1,6 +1,6 @@
 // 本地存储层（web 预览降级）—— 浏览器无 expo-sqlite 原生模块，改用 localStorage 持久化
 // 导出的 API 与 storage.ts（expo-sqlite 版）完全一致，由 Metro 按平台自动替换
-import { Document, Chunk, DocStatus } from '../types';
+import { Document, Chunk, DocStatus, CaseRecord } from '../types';
 
 const NS = 'techdocs.v1.db';
 
@@ -10,6 +10,8 @@ interface DBShape {
   kv: Record<string, string>;
   // 语义检索向量，vec 是 base64 后的 float32（比 JSON 数组省 60% 体积，localStorage 只有 5MB）
   embeddings: Array<{ chunkId: string; docId: string; model?: string; dim?: number; vec: string }>;
+  // 个人经验库（案例）。老数据没有这个键 → 视为空数组，不需要迁移
+  cases: CaseRecord[];
 }
 
 let cache: DBShape | null = null;
@@ -28,6 +30,7 @@ function load(): DBShape {
     chunks: Array.isArray(parsed?.chunks) ? parsed.chunks : [],
     kv: parsed?.kv && typeof parsed.kv === 'object' ? parsed.kv : {},
     embeddings: Array.isArray(parsed?.embeddings) ? parsed.embeddings : [],
+    cases: Array.isArray(parsed?.cases) ? parsed.cases : [],
   };
   return cache;
 }
@@ -220,4 +223,49 @@ export async function clearEmbeddings(): Promise<void> {
   const db = load();
   db.embeddings = [];
   persist();
+}
+
+// ---- 个人经验库（案例）----
+// web 版直接把 CaseRecord 存进数组（JSON 天然就是这个形状），不需要 storage.ts 那套列映射。
+// 存取都做一次浅拷贝：调用方拿到的对象不该被后续 save 意外改写。
+const cloneCase = (c: CaseRecord): CaseRecord => ({
+  ...c,
+  docIds: [...(c.docIds || [])],
+  tags: [...(c.tags || [])],
+});
+
+export async function listCases(): Promise<CaseRecord[]> {
+  return [...load().cases]
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+    .map(cloneCase);
+}
+
+/** 只取「已验证」的 —— 检索层的唯一入口，门禁（draft 不可见）在这里落地 */
+export async function listVerifiedCases(): Promise<CaseRecord[]> {
+  return (await listCases()).filter((c) => c.verified && !!c.finalFix);
+}
+
+export async function getCase(id: string): Promise<CaseRecord | null> {
+  const c = load().cases.find((x) => x.id === id);
+  return c ? cloneCase(c) : null;
+}
+
+export async function saveCase(c: CaseRecord): Promise<void> {
+  const db = load();
+  const i = db.cases.findIndex((x) => x.id === c.id);
+  const next = cloneCase(c);
+  if (i >= 0) db.cases[i] = next;
+  else db.cases.push(next);
+  persist();
+}
+
+export async function deleteCase(id: string): Promise<void> {
+  const db = load();
+  db.cases = db.cases.filter((x) => x.id !== id);
+  persist();
+}
+
+export async function countCases(): Promise<{ total: number; verified: number }> {
+  const list = load().cases;
+  return { total: list.length, verified: list.filter((c) => c.verified).length };
 }

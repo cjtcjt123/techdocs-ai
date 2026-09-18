@@ -36,9 +36,9 @@ export interface RetrievalConfig {
   tags: string[]; // 限定标签（空 = 全部资料）
 }
 
-// 全局搜索结果（资料库搜索页：文档名命中 + 原文片段命中）
+// 全局搜索结果（资料库搜索页：文档名命中 + 原文片段命中 + 经验库案例命中）
 export interface SearchResult {
-  kind: 'doc' | 'chunk';
+  kind: 'doc' | 'chunk' | 'case';
   docId: string;
   docName: string;
   pageNo?: number;
@@ -61,8 +61,56 @@ export interface Quote {
   pageNo?: number;
   snippet: string;
   score?: number; // 融合后的归一得分（0~1）
-  from?: string[]; // 命中该条的路：keyword / semantic / pinned
+  from?: string[]; // 命中该条的路：case / keyword / semantic / pinned
   pinned?: boolean; // 来自「钉住文档」，不是检索命中的
+  // ↓ 来源是「个人经验库」的案例，不是技术文档。UI 据此换徽章、正文据此提示「以你实测为准」
+  kind?: 'doc' | 'case';
+  caseId?: string;
+}
+
+// ============ 个人经验库（案例卡片）============
+// 定位：原始文档说「理论上怎么做」，经验库说「你这里实际怎么做成功的」。
+// 因此它比文档更有价值，也更危险 —— 一条错的案例会以最高优先级污染后续所有问答。
+export type CaseOutcome = 'success' | 'partial' | 'fail';
+
+export interface CaseRecord {
+  id: string;
+  title: string; // 问题/现象（一句话）
+  problem?: string; // 详细现象
+  product?: string; // 产品 / 型号
+  environment?: string; // 环境、设备型号、固件 / 软件版本
+  docIds?: string[]; // 关联的原始文档
+  aiAdvice?: string; // 当时 AI 给的方案（记录用，不参与检索打分）
+  rootCause?: string; // 根因
+  finalFix: string; // 必填：最终真正有效的操作
+  outcome: CaseOutcome; // 必填：结果
+  notes?: string; // 注意事项 / 坑 / 适用范围
+  tags: string[];
+  // 门禁：只有「已验证」才进检索池。草稿（如将来由 AI 起草的）对检索完全不可见 ——
+  // 否则模型的一次幻觉会戴上「你亲手记录的成功案例」的帽子进入下一次问答。
+  verified: boolean;
+  occurredAt?: string; // 发生时间
+  createdAt: string; // 记录时间
+  convId?: string; // 来源会话（可回溯当时的上下文）
+  msgId?: string; // 来源消息
+}
+
+// 记录表单的输入（UI → store）。id / createdAt 由 store 生成，避免界面自己造时间戳
+export interface CaseInput {
+  title?: string;
+  problem?: string;
+  product?: string;
+  environment?: string;
+  docIds?: string[];
+  aiAdvice?: string;
+  rootCause?: string;
+  finalFix: string;
+  outcome: CaseOutcome;
+  notes?: string;
+  tags?: string[];
+  occurredAt?: string;
+  convId?: string;
+  msgId?: string;
 }
 
 export type ModelSource = 'api' | 'local';

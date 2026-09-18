@@ -30,6 +30,8 @@ export async function getChunksByDocs(docIds, limit = 12) {
     .slice(0, limit)
     .map((c) => ({ ...c, docName: nameById.get(c.docId) || '?' }));
 }
+// 经验库：本脚本只测文档检索那几路，案例固定为空（经验库自己的契约测试在 test-cases.mjs）
+export async function listVerifiedCases() { return []; }
 `;
 const STUB_URL = 'data:text/javascript,' + encodeURIComponent(STUB);
 
