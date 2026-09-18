@@ -3,14 +3,23 @@
 // 关键词没命中、全靠语义兜住的那条会显式标「语义」，用户才知道该不该信。
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
-import { colors, mono, radius, shadow } from '../theme';
+import { colors, mono, radius, shadow, verdictColor } from '../theme';
 import type { Quote } from '../types';
 
 function badgeOf(q: Quote): { label: string; fg: string; bg: string } {
   const from = q.from || [];
   // 案例优先于其它徽章：这一条来自个人经验库、用户亲手验证过 ——
   // 回答里最该被看见的就是「这条不是文档说的，是你自己实测出来的」。
-  if (q.kind === 'case') return { label: '案例', fg: '#fff', bg: colors.caseInk };
+  if (q.kind === 'case') {
+    // 但失败记录要单独一档：它同样是「用户实测事实」，含义却相反 ——
+    // 不是「照这个做」，而是「这条路你试过，没成」。共用一个「案例」徽章的话，
+    // 用户看到 AI 引用它时会以为那是一条被推荐的做法。
+    if (q.outcome === 'fail') {
+      const c = verdictColor('no');
+      return { label: '失败案例', fg: c.fg, bg: c.bg };
+    }
+    return { label: '案例', fg: '#fff', bg: colors.caseInk };
+  }
   if (q.pinned) return { label: '钉住', fg: colors.muted, bg: colors.borderSoft };
   const kw = from.includes('keyword');
   const sem = from.includes('semantic');

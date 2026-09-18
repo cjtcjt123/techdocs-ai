@@ -134,11 +134,15 @@ export default function CaseFormModal({
           <View style={styles.sheet}>
             <View style={styles.sheetHead}>
               <View style={{ flex: 1, minWidth: 0 }}>
-                <Text style={styles.sheetTitle}>{isEdit ? '编辑案例' : '记录这次怎么解决的'}</Text>
+                <Text style={styles.sheetTitle}>
+                  {isEdit ? '编辑案例' : outcome === 'fail' ? '记录这次试了什么' : '记录这次怎么解决的'}
+                </Text>
                 <Text style={styles.sheetSub}>
                   {isEdit
                     ? '改完立刻生效 —— 下次问类似问题会用到新的内容'
-                    : '存进经验库后，下次问类似问题会被优先检索到'}
+                    : outcome === 'fail'
+                      ? '存进经验库后，AI 会把它当作「此路不通」提醒你，而不是当成方案推荐'
+                      : '存进经验库后，下次问类似问题会被优先检索到'}
                 </Text>
               </View>
               <Pressable hitSlop={10} onPress={onClose}>
@@ -170,14 +174,18 @@ export default function CaseFormModal({
                 选「失败」也有用：失败案例会被记为「在当时的条件下不成立」，换条件再试才有对照。
               </Text>
 
+              {/* 失败案例的措辞要跟着变：这个字段装的是「试了什么」，写成「最终解决」
+                  等于用字段名暗示「照这个做」，而 caseToText 里也据此换了标签 —— 两处必须一致 */}
               <Text style={styles.label}>
-                最终怎么解决的 <Text style={styles.req}>必填</Text>
+                {outcome === 'fail' ? '试过什么、后来怎样' : '最终怎么解决的'} <Text style={styles.req}>必填</Text>
               </Text>
               <TextInput
                 style={[styles.input, styles.inputMulti]}
                 value={finalFix}
                 onChangeText={(v) => { setFinalFix(v); if (err) setErr(null); }}
-                placeholder="例如：升温至 60℃ 抽真空 30 min，静置 5 min 后再浇注，气泡消除"
+                placeholder={outcome === 'fail'
+                  ? '例如：改用 B 方案（脱泡缩到 15 min）也不行，气泡照旧；怀疑与室温偏低有关'
+                  : '例如：升温至 60℃ 抽真空 30 min，静置 5 min 后再浇注，气泡消除'}
                 placeholderTextColor={colors.faint}
                 multiline
                 textAlignVertical="top"

@@ -10,7 +10,7 @@ import { colors, mono, radius, shadow, space, verdictColor } from '../theme';
 import { useStore } from '../store';
 import { CaseOutcome, CaseRecord } from '../types';
 import {
-  OUTCOMES, OUTCOME_LABEL, OUTCOME_VERDICT, filterCases, casesToMarkdown,
+  OUTCOMES, OUTCOME_LABEL, OUTCOME_VERDICT, filterCases, casesToMarkdown, finalFixLabel,
 } from '../lib/cases';
 import { shareText } from '../lib/export';
 
@@ -176,7 +176,7 @@ export default function CaseList() {
               {detail.environment ? <DetailRow label="环境" value={detail.environment} /> : null}
               {detail.problem ? <DetailRow label="问题 / 现象" value={detail.problem} /> : null}
               {detail.rootCause ? <DetailRow label="根因" value={detail.rootCause} /> : null}
-              <DetailRow label="最终解决" value={detail.finalFix} />
+              <DetailRow label={finalFixLabel(detail.outcome)} value={detail.finalFix} />
               {detail.notes ? <DetailRow label="注意" value={detail.notes} /> : null}
               {detail.tags?.length ? <DetailRow label="标签" value={detail.tags.join('、')} /> : null}
               <DetailRow label="记录时间" value={dayOf(detail)} />
