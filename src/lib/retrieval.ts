@@ -50,7 +50,19 @@ async function loadCorpus(): Promise<CorpusRow[]> {
 /**
  * 取经验库案例（已验证的）。读失败不抛 —— 经验库坏了不该让整个问答不可用。
  * 门禁（draft 不进召回池）在 indexableCases 里落地，只此一处。
+ *
+ * 导出给 rag：它需要知道每条案例的【结果】才能把「成功经验」与「失败记录」在上下文里
+ * 分开标注 —— 只靠 docId 前缀得知「这是案例」，得知不了「这条能不能照做」，而后者才是
+ * 决定模型该不该推荐它的依据。
+ *
+ * 刻意用【异步重读】而不是导出一个同步的缓存读取器：多一次 SELECT 的代价可以忽略，
+ * 但同步读缓存会引入「调用时序不对时拿到空数组」的假设 —— 那种情况下 outcome 全是
+ * undefined，失败记录会被静默退回「已验证案例」的老样子，正好是这次要修的 bug。
  */
+export async function listIndexableCases(): Promise<CaseRecord[]> {
+  return loadCaseCorpus();
+}
+
 async function loadCaseCorpus(): Promise<CaseRecord[]> {
   try {
     cachedCases = indexableCases(await listVerifiedCases());

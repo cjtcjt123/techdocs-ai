@@ -9,11 +9,12 @@
 //   BM25 分是无上界的，余弦相似度是 0~1，两者量纲不同，硬加权需要拍脑袋定归一化系数，
 //   换个语料就得重调。RRF 只依赖【排名】不依赖分数，天然免疫量纲问题，
 //   且让「多路都排前面」的结果胜出 —— 这正是混合检索想要的。
-import { searchChunks, semanticSearch } from './retrieval';
+import { searchChunks, semanticSearch, listIndexableCases } from './retrieval';
 import { getChunksByDocs } from './storage';
 import type { KeywordHit } from './keyword';
-import { caseIdOf, isCaseDocId } from './cases';
+import { caseIdOf, isCaseDocId, caseSourceLabel } from './cases';
 import type { EmbeddingConfig } from './settings';
+import type { CaseOutcome } from '../types';
 
 export interface Hit {
   docId: string;
@@ -27,17 +28,36 @@ export interface Hit {
   /** 'case' = 来自个人经验库（你亲手记录并验证过的），'doc' = 原始技术资料 */
   kind?: 'doc' | 'case';
   caseId?: string;
+  /**
+   * 仅案例有：这条记录的结果。
+   * 上下文拼装据此把「能照做的经验」与「试过没成的记录」分开标注 ——
+   * 只靠 docId 前缀能知道「这是案例」，但不知道「这条能不能照做」，而后者才是
+   * 决定模型该不该推荐它的依据。
+   */
+  outcome?: CaseOutcome;
 }
 
 // 经验库案例的权重。高于原始资料是刻意的：文档说的是「理论上怎么做」，
 // 案例说的是「你这里实际怎么做成功的」—— 后者才是可执行的那一层。
 // 代价必须说清：这条权重是在赌「用户亲手填的案例是对的」。所以门禁是「只有 verified 进召回池」，
 // 且回答里会显式标注来源性质，让人能一眼看出该不该信。
+//
+// ⚠️ 这个权重对【失败案例】同样生效（失败案例也在召回池里，见 cases.ts 的 indexableCases）。
+//    刻意留着：一条「这条路试过不行」的记录，恰恰是提问时最该先看到的 —— 它拦住的是一次
+//    重复的失败。前提是标注必须准确，所以 outcome 要一路带到上下文拼装。
 const CASE_WEIGHT = 2.5;
 const DOC_WEIGHT = 1;
 
-const toHit = (h: KeywordHit): Hit => {
+/**
+ * 建一个 hit 转换器，带上「案例 id → 结果」的小表。
+ *
+ * 为什么不让 toHit 自己去查：三路召回产出的都是 KeywordHit，它只有 docId 前缀能表明
+ * 「这是案例」，表明不了结果；而逐个去读库既慢又会把 IO 散进纯转换逻辑里。
+ * 表查一次、三路共用。
+ */
+const makeToHit = (caseOutcome: Map<string, CaseOutcome>) => (h: KeywordHit): Hit => {
   const isCase = isCaseDocId(h.docId);
+  const caseId = isCase ? caseIdOf(h.docId) : undefined;
   return {
     docId: h.docId,
     docName: h.docName,
@@ -45,7 +65,8 @@ const toHit = (h: KeywordHit): Hit => {
     pageNo: h.pageNo,
     score: h.score,
     kind: isCase ? 'case' : 'doc',
-    caseId: isCase ? caseIdOf(h.docId) : undefined,
+    caseId,
+    outcome: caseId ? caseOutcome.get(caseId) : undefined,
   };
 };
 
@@ -130,6 +151,11 @@ export async function retrieve(query: string, opts?: RetrieveOpts): Promise<Hit[
   //    让某一路的次优结果无辜出局
   const lists: RankedList[] = [];
   if ((query || '').trim()) {
+    // 案例结果：查一次、建张「id → 结果」的小表，本块内三路召回共用（见 makeToHit）。
+    // 刻意不去复用检索层的缓存读取器 —— 多一次极轻的 SELECT，换「一定拿得到值」：
+    // 拿不到值的后果是失败记录被静默标成正常经验，而那正是这次要修的 bug。
+    const caseOutcomes = new Map((await listIndexableCases()).map((c) => [c.id, c.outcome]));
+    const toHit = makeToHit(caseOutcomes);
     const kw = await searchChunks(query, Math.max(topK * 3, 20), { docIds: opts?.docIds });
     // 案例与文档来自同一次关键词召回（同一份语料），这里按虚拟 id 前缀拆成两路分别给权重。
     // 拆路的另一个好处：即便某条案例在整体 BM25 里排在第 30 位，它在「案例路」里的名次
@@ -167,13 +193,15 @@ export async function retrieve(query: string, opts?: RetrieveOpts): Promise<Hit[
 // 把检索结果拼成带编号的上下文，供 LLM 引用
 // 案例与资料必须长得不一样：模型要能一眼看出「这条是用户自己实测过的」，
 // 才有可能在两者冲突时以案例为准（提示词里另有明文要求）。
+// 案例内部还要再分一层：成功经验 vs 失败记录 —— 两者都该以「用户实测事实」的身份出现，
+// 但只有前者能被推荐照做（理由见 cases.ts 的 CASE_HEADER）。
 export function buildContext(hits: Hit[]): string {
   if (hits.length === 0) return '（资料库暂无相关内容）';
   return hits
     .map((h, i) => {
       if (h.kind === 'case') {
         const title = (h.docName || '').replace(/^案例 · /, '');
-        return `[来源${i + 1}] 【你已验证的经验案例】${title}\n${h.content}`;
+        return `[来源${i + 1}] 【${caseSourceLabel(h.outcome)}】${title}\n${h.content}`;
       }
       return `[来源${i + 1}] 《${h.docName}》${h.pageNo ? `第${h.pageNo}页` : ''}${h.pinned ? '（钉住资料）' : ''}\n${h.content}`;
     })
@@ -195,5 +223,7 @@ export function hitsToQuotes(hits: Hit[]) {
     // 来源性质：来源卡据此换徽章，用户据此决定要不要直接照做
     kind: h.kind ?? 'doc',
     caseId: h.caseId,
+    // 失败记录在来源卡上要单独标：用户扫一眼来源区的同时就该看到「这条是没成的」
+    outcome: h.kind === 'case' ? h.outcome : undefined,
   }));
 }
