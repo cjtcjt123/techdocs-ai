@@ -15,6 +15,12 @@ export interface DocMeta {
   pages?: number; // PDF 页数
   chars?: number; // 提取到的字符数（0 = 没提到内容）
   note?: string; // 未提取到 / 质量偏低的原因
+  /**
+   * 正文指纹（见 store.contentHash）。只用来判「这份是不是已经在库里了」。
+   * ⚠️ 按内容比、不按文件名比：NAS 同步会反复拉同名文件，改名也不该算新资料。
+   * 老文档没有这个字段 → 第一次去重时会被当成新资料（一次性，可接受）。
+   */
+  hash?: string;
 }
 
 export interface Document {

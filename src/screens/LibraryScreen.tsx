@@ -6,6 +6,7 @@ import { colors, mono, radius, shadow, space } from '../theme';
 import Button from '../components/Button';
 import CaseList from '../components/CaseList';
 import { useStore } from '../store';
+import { useShallow } from 'zustand/react/shallow';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { DocStatus, Document } from '../types';
@@ -45,14 +46,45 @@ function formatSize(n: number): string {
 }
 
 export default function LibraryScreen() {
+  // 同 ChatScreen：只订阅本屏用到的字段，别让「助手」那边的 thinking / 消息变化
+  // 拖着这一屏（以及它那份可能很长的文档列表）一起重渲染。
   const {
     documents, importFiles, importing, removeDoc, renameDoc,
     settings, nasFiles, nasScanning, browseNas, openNasDoc, nasCurrent,
     attachNasToChat, closeNasDoc, syncFromNas, lastError,
     togglePin, updateDocTags, runSearch, clearSearch,
+    batchRemoveDocs, batchAddTags,
     searchQuery, searchResults, searching,
     cases,
-  } = useStore();
+  } = useStore(
+    useShallow((s) => ({
+      documents: s.documents,
+      importFiles: s.importFiles,
+      importing: s.importing,
+      removeDoc: s.removeDoc,
+      renameDoc: s.renameDoc,
+      settings: s.settings,
+      nasFiles: s.nasFiles,
+      nasScanning: s.nasScanning,
+      browseNas: s.browseNas,
+      openNasDoc: s.openNasDoc,
+      nasCurrent: s.nasCurrent,
+      attachNasToChat: s.attachNasToChat,
+      closeNasDoc: s.closeNasDoc,
+      syncFromNas: s.syncFromNas,
+      lastError: s.lastError,
+      togglePin: s.togglePin,
+      updateDocTags: s.updateDocTags,
+      batchRemoveDocs: s.batchRemoveDocs,
+      batchAddTags: s.batchAddTags,
+      runSearch: s.runSearch,
+      clearSearch: s.clearSearch,
+      searchQuery: s.searchQuery,
+      searchResults: s.searchResults,
+      searching: s.searching,
+      cases: s.cases,
+    }))
+  );
   const navigation = useNavigation<NativeStackNavigationProp<any>>();
   const mode = settings.dataStrategy;
 
@@ -150,22 +182,27 @@ export default function LibraryScreen() {
   };
 
   // 批量加标签是【追加】而非覆盖：覆盖式批量编辑会把各文档原有的标签全部清掉
-  const batchAddTags = async (raw: string) => {
+  // 名字不能叫 batchAddTags —— 那是 store 里批量 action 的名字，两者会撞（本屏要同时用到）
+  const applyBatchTags = async (raw: string) => {
     const add = splitTags(raw);
     if (!add.length) { setBatchTag(null); return; }
     setBatchBusy(true);
     try {
-      for (const d of selectedDocs) {
-        await updateDocTags(d.id, Array.from(new Set([...(d.tags || []), ...add])));
-      }
+      // 同 batchDelete：一次刷新。追加语义在 store 的 batchAddTags 里（各文档原标签保留）
+      await batchAddTags(selectedDocs.map((d) => d.id), add);
     } finally { setBatchBusy(false); exitSelect(); }
   };
 
   const batchDelete = async () => {
     setBatchBusy(true);
     try {
-      for (const d of selectedDocs) await removeDoc(d.id);
-    } finally { setBatchBusy(false); exitSelect(); }
+      // 走批量 action：删 N 份只刷新一次库。逐份调 removeDoc 的话每份都要全表重查一次
+      // 并触发一整轮列表重渲染，20 份就是 20 次 —— 而且中途抛错会变成未捕获的 rejection。
+      await batchRemoveDocs(selectedDocs.map((d) => d.id));
+    } finally {
+      // finally 而不是 try 末尾：无论删没删干净，都不能把界面留在「处理中…」
+      setBatchBusy(false); exitSelect();
+    }
   };
 
   const onSearch = (t: string) => {
@@ -674,7 +711,7 @@ export default function LibraryScreen() {
               <Button label="取消" variant="ghost" onPress={() => setBatchTag(null)} style={{ flex: 1 }} />
               <Button
                 label={batchBusy ? '处理中…' : '加进去'}
-                onPress={() => void batchAddTags(batchTag)}
+                onPress={() => void applyBatchTags(batchTag)}
                 disabled={batchBusy || !splitTags(batchTag).length}
                 style={{ flex: 1, marginLeft: space.s2 }}
               />

@@ -148,8 +148,20 @@ export async function testModel(cfg: ModelConfig): Promise<ConnTestResult> {
   }
 }
 
-export async function chat(cfg: ModelConfig, messages: ChatMsg[]): Promise<string> {
+/**
+ * 中断信号。两条来源的中断方式不同，别指望一个 signal 通吃：
+ *   · 云端 —— fetch 认 `signal`，abort 立刻断连接
+ *   · 本地 —— llama.rn 的 completion 不认 signal，得调 `stopLocalChat()`
+ * 所以 store 里的「停止生成」是**两个一起做**的（见 store.stopGeneration 的注释）。
+ */
+export interface ChatOpts {
+  signal?: AbortSignal;
+}
+
+export async function chat(cfg: ModelConfig, messages: ChatMsg[], opts?: ChatOpts): Promise<string> {
   if (cfg.source === 'local') {
+    // 已经开始前就取消的话直接退出，别再白白跑一遍（生成中的中断由 stopLocalChat 负责）
+    if (opts?.signal?.aborted) throw new Error('已取消');
     // 手机本地：走 llama.cpp（llama.rn）。三道门各自给出可直接照做的提示，
     // 而不是笼统一句「不可用」——这三种失败原因用户要做的事完全不同。
     const av = localAvailability();
@@ -173,13 +185,14 @@ export async function chat(cfg: ModelConfig, messages: ChatMsg[]): Promise<strin
   if (!allowed) {
     throw new Error('已取消本次云端调用（资料未发出）。不想每次都确认，可到「我的 → 隐私与安全」关掉「云端调用需确认」。');
   }
-  if (t.claude) return chatClaude(t, messages);
+  if (t.claude) return chatClaude(t, messages, opts?.signal);
 
   const url = joinPath(t.baseURL, '/chat/completions');
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t.apiKey}` },
     body: JSON.stringify({ model: t.model, messages, stream: false, temperature: 0.2 }),
+    signal: opts?.signal,
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
@@ -191,7 +204,7 @@ export async function chat(cfg: ModelConfig, messages: ChatMsg[]): Promise<strin
   return content;
 }
 
-async function chatClaude(t: Resolved, messages: ChatMsg[]): Promise<string> {
+async function chatClaude(t: Resolved, messages: ChatMsg[], signal?: AbortSignal): Promise<string> {
   const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
   const msgs = messages
     .filter((m) => m.role !== 'system')
@@ -201,6 +214,7 @@ async function chatClaude(t: Resolved, messages: ChatMsg[]): Promise<string> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': t.apiKey, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({ model: t.model, system, messages: msgs, max_tokens: 2000 }),
+    signal,
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');

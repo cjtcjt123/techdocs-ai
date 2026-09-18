@@ -1,24 +1,62 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, TextInput, ScrollView, StyleSheet, Pressable, Alert, KeyboardAvoidingView, Platform, Share } from 'react-native';
-import { colors, mono, radius, space } from '../theme';
+import { colors, mono, radius, shadow, space } from '../theme';
 import Button from '../components/Button';
 import SourceCard from '../components/SourceCard';
 import ComplianceTable from '../components/ComplianceTable';
 import CaseFormModal from '../components/CaseFormModal';
 import type { CasePrefill } from '../components/CaseFormModal';
 import { useStore } from '../store';
+import { useShallow } from 'zustand/react/shallow';
 import { Attachment, Message, Conversation, ComplianceResult, Quote } from '../types';
 import { complianceToFormat, convToMarkdown, shareText } from '../lib/export';
 import { draftFromTurn } from '../lib/cases';
 
+// 空态里的常用问题。写具体型号而不是「查个指标」这类空话 ——
+// 点一下真能得到答案，才知道这个输入框该怎么用。
+const QUICK = ['CY1578 的适用温度范围', '混合比例与操作时间', '保质期是多久', '和 HY5192 的区别'];
+
 export default function ChatScreen() {
+  // useShallow 包一层：只订阅下面列出来的这些字段。
+  // 裸用 useStore() 会订阅整个 store —— 于是「我的」页改个设置、资料库扫一次 NAS
+  // （nasFiles / nasScanning）都会让这一屏连同它的消息列表一起重渲染，
+  // 而切 Tab 时两屏是同时挂着的，这类无谓重渲染在真机上就是掉帧。
   const {
     conversations, currentConvId, newConversation, switchConversation, deleteConversation,
-    renameConversation, sendMessage, runCompliance, thinking, pickAttachments, pickImage,
+    renameConversation, sendMessage, runCompliance, stopGeneration, thinking, pickAttachments, pickImage,
     lastError, pendingNasAttachment, clearPendingNas, settings, updateRetrieval, documents,
-    lastRetrieval,
-  } = useStore();
+    lastRetrieval, cases, embeddingCount, embeddingTotal,
+  } = useStore(
+    useShallow((s) => ({
+      conversations: s.conversations,
+      currentConvId: s.currentConvId,
+      newConversation: s.newConversation,
+      switchConversation: s.switchConversation,
+      deleteConversation: s.deleteConversation,
+      renameConversation: s.renameConversation,
+      sendMessage: s.sendMessage,
+      runCompliance: s.runCompliance,
+      stopGeneration: s.stopGeneration,
+      thinking: s.thinking,
+      pickAttachments: s.pickAttachments,
+      pickImage: s.pickImage,
+      lastError: s.lastError,
+      pendingNasAttachment: s.pendingNasAttachment,
+      clearPendingNas: s.clearPendingNas,
+      settings: s.settings,
+      updateRetrieval: s.updateRetrieval,
+      documents: s.documents,
+      lastRetrieval: s.lastRetrieval,
+      cases: s.cases,
+      embeddingCount: s.embeddingCount,
+      embeddingTotal: s.embeddingTotal,
+    }))
+  );
   const [text, setText] = useState('');
+  // 输入栏的模式开关：「问一句」= 普通提问，「贴要求核对」= 逐项比对。
+  // 后者就是原来那个独立的「对比」Tab —— 两条路本来就是同一段提示词、同一个 system prompt，
+  // 只有「结果去哪」不同，摆成两个入口只会让人不知道该点哪个。现在合成一个输入栏、一份会话记录。
+  const [mode, setMode] = useState<'chat' | 'compliance'>('chat');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [showConvs, setShowConvs] = useState(false);
   // 删除会话的二次确认：点 🗑 先变成「确认删除」，再点才真删（不依赖平台弹窗，web/真机一致）
@@ -93,13 +131,16 @@ export default function ChatScreen() {
 
   const removeAttach = (idx: number) => setAttachments((a) => a.filter((_, i) => i !== idx));
 
-  const submit = (mode: 'chat' | 'compliance') => {
+  const submit = () => {
+    // 双保险：store 里也守了一道。这里守的是「手快点了两次」——
+    // 两次点击之间 set({thinking:true}) 可能还没回流到这一屏。
+    if (thinking) return;
     if (!text.trim() && attachments.length === 0) return;
     const payload = text.trim();
     const att = [...attachments];
     setText(''); setAttachments([]);
-    if (mode === 'compliance') runCompliance(payload, att.length ? att : undefined);
-    else sendMessage(payload, att.length ? att : undefined);
+    if (mode === 'compliance') void runCompliance(payload, att.length ? att : undefined);
+    else void sendMessage(payload, att.length ? att : undefined);
   };
 
   // 打开「记录解决过程」。预填是纯规则拼装，不调模型：
@@ -132,6 +173,11 @@ export default function ChatScreen() {
 
   return (
     <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      {/* 标题栏：Tab 页不带系统 header，自己画一个。
+          会话切换与「＋新会话」仍留在它下面那一行 —— 两件事各占一行，顶栏不再是塞了三个控件的拥挤横条。 */}
+      <View style={styles.header}>
+        <Text style={styles.headerTitle}>助手</Text>
+      </View>
       <View style={styles.convBar}>
         <Pressable style={styles.convPick} onPress={() => { setShowConvs((v) => !v); setConfirmDel(null); }}>
           <Text style={styles.convTitle} numberOfLines={1}>{convTitle}</Text>
@@ -299,8 +345,37 @@ export default function ChatScreen() {
       <ScrollView ref={scrollRef} style={styles.list} contentContainerStyle={styles.listInner}>
         {messages.length === 0 && (
           <View style={styles.welcome}>
-            <Text style={styles.welcomeText}>你好，导入资料后即可用自然语言提问。</Text>
-            <Text style={styles.welcomeHint}>试试：「只给我 CY1578 的耐温值」「提取配置步骤」，或贴一段技术要求做「需求符合性检查」。</Text>
+            {/* 状态卡从「工作台」整屏搬过来 —— 那一屏取消了，但这三个数字是每次进 App 都想瞟一眼的，
+                丢掉可惜。放在空态里恰好：有消息时它自然让位给对话。 */}
+            <View style={styles.bento}>
+              <View style={styles.bentoCard}>
+                <Text style={styles.bentoK}>资料</Text>
+                <Text style={styles.bentoV}>{documents.length}<Text style={styles.bentoU}>份</Text></Text>
+              </View>
+              <View style={styles.bentoCard}>
+                <Text style={styles.bentoK}>经验案例</Text>
+                <Text style={styles.bentoV}>{cases.length}<Text style={styles.bentoU}>条</Text></Text>
+              </View>
+              <View style={styles.bentoCard}>
+                <Text style={styles.bentoK}>语义索引</Text>
+                <Text style={styles.bentoV}>
+                  {embeddingCount}
+                  <Text style={styles.bentoU}>/{embeddingTotal || 0}</Text>
+                </Text>
+                <View style={styles.bentoBar}>
+                  <View style={[styles.bentoBarI, { width: `${embeddingTotal ? Math.round((embeddingCount / embeddingTotal) * 100) : 0}%` }]} />
+                </View>
+              </View>
+            </View>
+            <Text style={styles.welcomeText}>问点什么，或者直接贴一段技术要求。</Text>
+            <Text style={styles.welcomeHint}>答案会带上来源页码。要核对规格书，把下面的模式切到「贴要求核对」。</Text>
+            <View style={styles.quickRow}>
+              {QUICK.map((c) => (
+                <Pressable key={c} style={styles.quickChip} onPress={() => setText(c)}>
+                  <Text style={styles.quickChipT}>{c}</Text>
+                </Pressable>
+              ))}
+            </View>
           </View>
         )}
         {messages.map((m, i) => (
@@ -326,7 +401,22 @@ export default function ChatScreen() {
         </View>
       )}
 
-      <View style={styles.inputBar}>
+      {/* 模式条放在输入栏【上方】：它是「这个输入框眼下按哪种方式处理」的开关，贴着输入框才说得通。
+          放在下面的话，往上滚着看历史时屏幕里就看不到它了 —— 而「把一段技术要求当普通问题发出去」
+          的代价是答非所问，这个错不能靠用户记性来防。 */}
+      <View style={styles.modeBar}>
+        <View style={styles.seg}>
+          <Pressable style={[styles.segItem, mode === 'chat' && styles.segItemOn]} onPress={() => setMode('chat')}>
+            <Text style={[styles.segText, mode === 'chat' && styles.segTextOn]}>问一句</Text>
+          </Pressable>
+          <Pressable style={[styles.segItem, mode === 'compliance' && styles.segItemOn]} onPress={() => setMode('compliance')}>
+            <Text style={[styles.segText, mode === 'compliance' && styles.segTextOn]}>贴要求核对</Text>
+          </Pressable>
+        </View>
+        {lastError ? <Text style={styles.errText} numberOfLines={1}>{lastError}</Text> : null}
+      </View>
+
+      <View style={[styles.inputBar, mode === 'compliance' && styles.inputBarHot]}>
         <Pressable style={styles.attBtn} onPress={addAttachments}>
           <Text style={{ fontSize: 18 }}>📎</Text>
         </Pressable>
@@ -335,22 +425,23 @@ export default function ChatScreen() {
         </Pressable>
         <TextInput
           style={styles.input}
-          placeholder="输入问题，或粘贴报错信息…"
-          placeholderTextColor={colors.muted}
+          placeholder={mode === 'compliance' ? '贴上技术要求…' : '输入问题，或粘贴报错信息…'}
+          placeholderTextColor={mode === 'compliance' ? colors.primary : colors.muted}
           value={text}
           onChangeText={setText}
           multiline
+          // 生成中不让改：能打字但发不出去，比直接禁用更让人困惑（会以为 App 卡了）
+          editable={!thinking}
         />
-        <Pressable style={styles.send} onPress={() => submit('chat')}>
-          <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>发送</Text>
-        </Pressable>
-      </View>
-
-      <View style={styles.modeBar}>
-        <Pressable style={styles.complianceBtn} onPress={() => submit('compliance')}>
-          <Text style={styles.complianceText}>✓ 需求符合性检查</Text>
-        </Pressable>
-        {lastError ? <Text style={styles.errText} numberOfLines={1}>{lastError}</Text> : null}
+        {thinking ? (
+          <Pressable style={[styles.send, styles.sendStop]} onPress={stopGeneration}>
+            <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>停止</Text>
+          </Pressable>
+        ) : (
+          <Pressable style={styles.send} onPress={submit}>
+            <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>{mode === 'compliance' ? '核对' : '发送'}</Text>
+          </Pressable>
+        )}
       </View>
       {exportState && (
         <View style={styles.overlay}>
@@ -510,6 +601,8 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   toastText: { color: '#fff', fontSize: 12.5, fontWeight: '600' },
+  header: { paddingHorizontal: space.s3, paddingTop: space.s3, paddingBottom: space.s1, backgroundColor: colors.surface },
+  headerTitle: { fontSize: 26, fontWeight: '700', color: colors.text, letterSpacing: -0.8 },
   convBar: { flexDirection: 'row', alignItems: 'center', gap: space.s2, paddingHorizontal: space.s3, paddingVertical: space.s2, backgroundColor: colors.surface, borderBottomWidth: 1, borderBottomColor: colors.border },
   convPick: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: colors.background, borderRadius: radius.sm, paddingVertical: 7, paddingHorizontal: space.s2 },
   convTitle: { flex: 1, fontSize: 13, fontWeight: '600', color: colors.text },
@@ -528,9 +621,20 @@ const styles = StyleSheet.create({
   convDelYes: { fontSize: 12, color: colors.red, fontWeight: '700' },
   list: { flex: 1 },
   listInner: { padding: space.s3, paddingBottom: space.s2 },
-  welcome: { paddingVertical: space.s4, alignItems: 'center' },
+  welcome: { paddingVertical: space.s3, alignItems: 'center' },
   welcomeText: { fontSize: 15, color: colors.text, marginBottom: 6 },
   welcomeHint: { fontSize: 12, color: colors.muted, textAlign: 'center', paddingHorizontal: space.s4, lineHeight: 18 },
+  // 空态状态卡（原来「工作台」那一屏的三张）：等宽三列，数字用等宽字体，改天数值变化时列宽不跳
+  bento: { flexDirection: 'row', gap: 8, alignSelf: 'stretch', marginBottom: space.s4 },
+  bentoCard: { flex: 1, minWidth: 0, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, paddingVertical: 11, paddingHorizontal: 12, ...shadow.card },
+  bentoK: { fontFamily: mono, fontSize: 9.5, letterSpacing: 0.9, color: colors.muted },
+  bentoV: { fontFamily: mono, fontSize: 16, fontWeight: '700', color: colors.text, marginTop: 7 },
+  bentoU: { fontSize: 10.5, fontWeight: '600', color: colors.muted },
+  bentoBar: { height: 4, borderRadius: 2, backgroundColor: colors.border, marginTop: 8, overflow: 'hidden' },
+  bentoBarI: { height: 4, backgroundColor: colors.primary },
+  quickRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 7, justifyContent: 'center', marginTop: space.s3 },
+  quickChip: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingVertical: 7, paddingHorizontal: 11 },
+  quickChipT: { fontSize: 11.5, color: colors.text2 },
   row: { flexDirection: 'row', marginBottom: space.s2 },
   rowUser: { justifyContent: 'flex-end' },
   rowAi: { justifyContent: 'flex-start' },
@@ -562,15 +666,23 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'flex-end', padding: space.s2, paddingBottom: space.s2 + (Platform.OS === 'ios' ? 0 : 0),
     borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.surface, gap: space.s1,
   },
+  // 核对模式下给输入栏描一圈主色边：切了模式而输入框毫无变化的话，人不会意识到模式变了
+  inputBarHot: { borderTopColor: colors.primary },
   attBtn: { width: 38, height: 38, borderRadius: 999, backgroundColor: colors.background, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: colors.border },
   input: {
     flex: 1, backgroundColor: colors.background, borderRadius: radius.sm, paddingVertical: space.s2 - 3,
     paddingHorizontal: space.s3, fontSize: 14, color: colors.text, maxHeight: 100,
   },
   send: { backgroundColor: colors.primary, borderRadius: radius.sm, paddingVertical: space.s2 - 3, paddingHorizontal: space.s3, alignItems: 'center', justifyContent: 'center', height: 38 },
-  modeBar: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: space.s3, paddingBottom: space.s3, gap: space.s2, backgroundColor: colors.surface, borderTopWidth: 1, borderTopColor: colors.border },
-  complianceBtn: { backgroundColor: colors.greenSoft, borderRadius: radius.sm, paddingVertical: space.s2 - 3, paddingHorizontal: space.s3 },
-  complianceText: { color: colors.green, fontSize: 13, fontWeight: '700' },
+  // 生成中的「停止」：换成中性灰，和紫色的「发送」区分开 —— 一眼能看出这一下不是发送
+  sendStop: { backgroundColor: colors.text2 },
+  // 模式条：两个分段的开关，紧贴输入框上方
+  modeBar: { paddingHorizontal: space.s3, paddingBottom: space.s2, backgroundColor: colors.surface },
+  seg: { flexDirection: 'row', backgroundColor: colors.cardAlt, borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: 3, gap: 3 },
+  segItem: { flex: 1, paddingVertical: 8, borderRadius: radius.md - 3, alignItems: 'center' },
+  segItemOn: { backgroundColor: colors.card },
+  segText: { fontSize: 12.5, fontWeight: '600', color: colors.muted },
+  segTextOn: { color: colors.primary },
   errText: { fontSize: 11, color: colors.red, flex: 1, textAlign: 'right' },
   // 会话重命名（就地编辑）
   convTitleInput: {

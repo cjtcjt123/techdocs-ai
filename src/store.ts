@@ -24,6 +24,7 @@ import type { ParseContext } from './lib/parser';
 import { retrieve, buildContext, hitsToQuotes } from './lib/rag';
 import type { Hit } from './lib/rag';
 import { chat, ChatMsg } from './lib/llm';
+import { stopLocalChat } from './lib/local-llm';
 import { compliancePrompt, parseCompliance } from './lib/compliance';
 import { loadSettings, saveSettings, AppSettings } from './lib/settings';
 import { setPrivacySwitches, setConfirmHook } from './lib/net-guard';
@@ -45,6 +46,63 @@ async function persistConversations(convs: Conversation[]): Promise<void> {
 
 // 内存中保存当前解锁密码（本地 App，足够 MVP；安全存储由 secure-store 落盘）
 let currentPasscode = '';
+
+// ---------------------------------------------------------------- 生成控制（可中断 + 超时）
+//
+// 为什么要有这一层：以前 chat() 一发出去就没有回头路 —— 网络挂起（NAS 关机、手机连上
+// 没出口的 Wi-Fi）时界面会**永久停在「思考中」**，用户只能杀 App 重开；本地模型同理，
+// 一个 3B 模型在旧手机上跑几百 token 要几十秒，中途想改问法只能干等。
+//
+// 两个标志分开记，因为【用户主动停止】和【超时】要给人看的话完全不同：
+//   · 主动停止 —— 不是故障，说「已停止」
+//   · 超时     —— 是失败，要说清可能是网络或模型那边的问题
+let genCtl: AbortController | null = null;
+let genStopped = false;
+let genTimedOut = false;
+
+/** 生成的默认上限。正常回答几秒到几十秒，超过 120 秒基本就是网络或服务端出问题了 */
+const GEN_TIMEOUT_MS = 120_000;
+
+/**
+ * 正文指纹，只用来判重（导入 / NAS 同步时「这份是不是已经在库里了」）。
+ *
+ * 刻意**取样**而不是全量哈希：几 MB 的 PDF 正文逐字符跑一遍没必要，
+ * 而「头 60k + 尾 60k + 总长度」这三个数要撞，得是两份几乎一样的资料 —— 那正是该判重的。
+ * 结尾带上长度，是为了让「同样开头但长短不同」的两份不会误判成同一份。
+ */
+function contentHash(text: string): string {
+  const sample = text.length <= 120_000 ? text : text.slice(0, 60_000) + text.slice(-60_000);
+  let h = 5381;
+  for (let i = 0; i < sample.length; i++) h = ((h << 5) + h + sample.charCodeAt(i)) | 0;
+  return `${(h >>> 0).toString(36)}-${text.length}`;
+}
+
+/** 标签清洗（去空、去重、trim）。单条与批量两条路共用，避免一边清洗一边不清洗 */
+function cleanTags(tags: string[]): string[] {
+  return Array.from(new Set(tags.map((t) => t.trim()).filter(Boolean)));
+}
+
+/**
+ * 开一次可中断的生成。返回的 `done()` **必须**在 finally 里调，否则定时器会泄漏。
+ * ⚠️ 没用 `AbortSignal.timeout()`：那是比较新的 API，Hermes 不保证有，手写更稳。
+ */
+function beginGeneration(timeoutMs = GEN_TIMEOUT_MS) {
+  const ac = new AbortController();
+  genStopped = false;
+  genTimedOut = false;
+  genCtl = ac;
+  const timer = setTimeout(() => {
+    genTimedOut = true;
+    ac.abort();
+  }, timeoutMs);
+  return {
+    signal: ac.signal,
+    done: () => {
+      clearTimeout(timer);
+      if (genCtl === ac) genCtl = null;
+    },
+  };
+}
 
 // 「云端调用需确认」弹窗的挂起回调。放在模块级而不是 state 里：
 // 它是个函数、不参与渲染，放进 state 只会让每次 set 都触发一次无意义的重渲染。
@@ -139,10 +197,6 @@ interface State {
   embeddingTotal: number;
   embeddingBusy: boolean;
   embeddingProgress: string | null;
-  // 独立「对比」页的结果（不写进会话，避免污染聊天记录）
-  compareResult: ComplianceResult | null;
-  compareBusy: boolean;
-  compareError: string | null;
   // 最近一次检索的过程数据（问答页顶部的检索步骤条）
   lastRetrieval: RetrievalStats | null;
   // 个人经验库：案例卡片（含未验证的草稿 —— 列表要显示全部，而检索只吃 verified）
@@ -165,6 +219,10 @@ interface State {
   renameDoc: (id: string, name: string) => Promise<void>;
   togglePin: (id: string) => Promise<void>;
   updateDocTags: (id: string, tags: string[]) => Promise<void>;
+  // 批量版：写 N 条只刷新一次（见实现处的注释）
+  batchRemoveDocs: (ids: string[]) => Promise<void>;
+  batchTogglePin: (ids: string[], pinned: boolean) => Promise<void>;
+  batchAddTags: (ids: string[], tags: string[]) => Promise<void>;
   allTags: () => string[];
   runSearch: (q: string) => Promise<void>;
   clearSearch: () => void;
@@ -177,8 +235,7 @@ interface State {
   renameConversation: (id: string, title: string) => Promise<void>;
   sendMessage: (text: string, attachments?: Attachment[]) => Promise<void>;
   runCompliance: (text: string, attachments?: Attachment[]) => Promise<void>;
-  runCompare: (text: string) => Promise<void>;
-  clearCompare: () => void;
+  stopGeneration: () => void;
   updateSettings: (patch: Partial<AppSettings>) => Promise<void>;
   saveNas: (conn: NasConnection, password: string) => Promise<void>;
   syncFromNas: () => Promise<void>;
@@ -191,6 +248,9 @@ interface State {
   pickImage: () => Promise<Attachment[]>;
   setPasscode: (code: string) => Promise<void>;
   unlock: (code: string) => boolean;
+  /** 面容 / 指纹通过后解锁。⚠️ 调用方必须已经拿到 biometricAuth() === true ——
+   *  store 这边无从验证，所以它是「信任调用方」的接口，只该被锁屏调用。 */
+  unlockByBiometric: () => void;
   lock: () => void;
 }
 
@@ -257,7 +317,7 @@ export const useStore = create<State>((set, get) => ({
   settings: {
     modelConfig: { source: 'api', provider: 'openai', baseURL: '', apiKey: '', model: 'gpt-4o-mini' },
     dataStrategy: 'local',
-    privacy: { faceID: false, offlineMode: false, cloudConfirm: false },
+    privacy: { lock: false, biometric: true, offlineMode: false, cloudConfirm: false },
     exportFormat: 'markdown',
     retrieval: { topK: 8, onlyPinned: false, tags: [] },
   },
@@ -278,9 +338,6 @@ export const useStore = create<State>((set, get) => ({
   embeddingTotal: 0,
   embeddingBusy: false,
   embeddingProgress: null,
-  compareResult: null,
-  compareBusy: false,
-  compareError: null,
   lastRetrieval: null,
   cases: [],
   pendingConfirm: null,
@@ -321,7 +378,10 @@ export const useStore = create<State>((set, get) => ({
       settings,
       nasPassword: nasPw || '',
       passcodeSet: !!pc,
-      locked: !!pc, // 若已设密码，则启动即锁
+      // 「启动时锁定」这个开关就是在这里生效的：设了密码 + 开关开着，才启动即锁。
+      // 以前写的是 `!!pc`（只看有没有密码），等于开关关着也照样锁 —— 开关形同虚设。
+      // 而「立即锁定」是用户明确的动作，走 lock() 无条件置 true，不受这个开关约束。
+      locked: !!pc && !!settings.privacy.lock,
     });
     void get().refreshEmbeddingStats();
     void get().loadCases();
@@ -373,10 +433,16 @@ export const useStore = create<State>((set, get) => ({
     await commitCase(set, get, { ...base, verified });
   },
 
+  // 以前这是唯一没有 try/catch 的写操作 —— 删失败会变成未捕获的 rejection，
+  // 界面上什么都不发生，用户只会以为「这个删除键坏了」。
   async removeCase(id) {
-    await deleteCaseRow(id);
-    set({ cases: get().cases.filter((c) => c.id !== id) });
-    invalidateRetrievalIndex();
+    try {
+      await deleteCaseRow(id);
+      set({ cases: get().cases.filter((c) => c.id !== id) });
+      invalidateRetrievalIndex();
+    } catch (e: any) {
+      set({ lastError: e?.message || '删除案例失败' });
+    }
   },
 
   async importFiles() {
@@ -388,10 +454,17 @@ export const useStore = create<State>((set, get) => ({
       if (res.canceled) { set({ importing: false }); return; }
       const ctx = parseContext(get());
       const failed: string[] = [];
+      let skipped = 0;
+      // 已入库的正文指纹。动态往里加 —— 本次选中的几份里如果彼此相同，也该只留一份。
+      // 没解析出文本的不参与判重（它本来也进不了索引，留着是让用户看见「这份没解析成功」）。
+      const seen = new Set(get().documents.map((d) => d.meta?.hash).filter(Boolean) as string[]);
       for (const a of res.assets) {
         const type = extToType(a.name);
         // 先解析再入库：meta 一次写全，省掉一次补更新
         const out = await parseAsset(a, ctx);
+        const hash = out.text ? contentHash(out.text) : '';
+        if (hash && seen.has(hash)) { skipped++; continue; }
+        if (hash) seen.add(hash);
         const doc: Document = {
           id: uid(), name: a.name, type, folderId: null, tags: [],
           status: out.text ? 'indexed' : 'partial',
@@ -402,6 +475,7 @@ export const useStore = create<State>((set, get) => ({
             pages: out.pages,
             chars: out.text?.length ?? 0,
             note: out.note,
+            hash: hash || undefined,
           },
           createdAt: new Date().toISOString(),
         };
@@ -413,10 +487,15 @@ export const useStore = create<State>((set, get) => ({
           failed.push(`${a.name}：${out.note || '未能提取到文本'}`);
         }
       }
+      // 「跳过 N 份」不是错误，但界面上没有别的提示位，借 lastError 这条通道告诉用户结果 ——
+      // 不说的话，用户会以为导入失败了自己却不知道少了几份。
+      const notes: string[] = [];
+      if (skipped) notes.push(`已跳过 ${skipped} 份：库里已经有内容完全相同的资料了`);
+      if (failed.length) notes.push(`以下文件未索引到内容\n${failed.join('\n')}`);
       set({
         documents: await getDocuments(),
         importing: false,
-        lastError: failed.length ? `以下文件未索引到内容\n${failed.join('\n')}` : null,
+        lastError: notes.length ? notes.join('\n\n') : null,
       });
     } catch (e: any) {
       set({ importing: false, lastError: e?.message || '导入失败' });
@@ -443,9 +522,52 @@ export const useStore = create<State>((set, get) => ({
 
   // 覆盖式设置标签（去重、去空）
   async updateDocTags(id, tags) {
-    const clean = Array.from(new Set(tags.map((t) => t.trim()).filter(Boolean)));
-    await setDocumentTags(id, clean);
+    await setDocumentTags(id, cleanTags(tags));
     set({ documents: await getDocuments() });
+  },
+
+  // ---- 批量操作：写 N 条，只刷新一次 ----
+  //
+  // 以前界面层是循环调单条 action，而每条 action 内部都 `set({ documents: await getDocuments() })`
+  // —— 删 20 份 = 20 次全表 SELECT + 20 次全量 setState（每次都让整个资料库列表重渲染一遍）。
+  // 这里改成「循环写 → 最后刷新一次」，单条 action 的行为保持不变（它们还有各自的调用点）。
+  // 异常也必须兜住：以前界面是 try/finally 没有 catch，中途一抛错就是未捕获 rejection，
+  // 而且 busy 状态虽然 finally 会复位，但用户看不到任何失败提示。
+  async batchRemoveDocs(ids) {
+    if (!ids.length) return;
+    try {
+      for (const id of ids) await deleteDocument(id);
+      set({ documents: await getDocuments() });
+    } catch (e: any) {
+      // 可能只删掉了一部分 —— 刷新一次把真实结果摆出来，别让用户以为全成了
+      set({ documents: await getDocuments(), lastError: e?.message || '批量删除失败（可能只删掉一部分）' });
+    }
+  },
+
+  async batchTogglePin(ids, pinned) {
+    if (!ids.length) return;
+    try {
+      for (const id of ids) await setDocumentPinned(id, pinned);
+      set({ documents: await getDocuments() });
+    } catch (e: any) {
+      set({ documents: await getDocuments(), lastError: e?.message || '批量操作失败（可能只改了一部分）' });
+    }
+  },
+
+  /** 追加式批量加标签：各文档原有标签保留 */
+  async batchAddTags(ids, tags) {
+    if (!ids.length) return;
+    const add = cleanTags(tags);
+    if (!add.length) return;
+    try {
+      for (const id of ids) {
+        const doc = get().documents.find((d) => d.id === id);
+        await setDocumentTags(id, Array.from(new Set([...(doc?.tags || []), ...add])));
+      }
+      set({ documents: await getDocuments() });
+    } catch (e: any) {
+      set({ documents: await getDocuments(), lastError: e?.message || '批量加标签失败（可能只加了一部分）' });
+    }
   },
 
   // 资料库已有标签全集（分组筛选用）
@@ -586,6 +708,9 @@ export const useStore = create<State>((set, get) => ({
   },
 
   async sendMessage(text, attachments) {
+    // 生成中拒绝新提问：连发两条的话，两个回答按返回先后追加，
+    // 先问的那个可能反而排在后面 —— 界面上看到的就是「答非所问」。
+    if (get().thinking) return;
     let convId = get().currentConvId;
     if (!convId) { get().newConversation(); convId = get().currentConvId!; }
     const conv = get().conversations.find((c) => c.id === convId)!;
@@ -593,6 +718,7 @@ export const useStore = create<State>((set, get) => ({
     const updated = { ...conv, messages: [...conv.messages, userMsg] };
     set({ conversations: get().conversations.map((c) => (c.id === convId ? updated : c)), thinking: true, lastError: null });
 
+    const gen = beginGeneration();
     try {
       const hits = await retrieve(text || '', resolveScope(get()));
       set({ lastRetrieval: summarizeHits(hits, get().embeddingTotal) });
@@ -623,43 +749,61 @@ export const useStore = create<State>((set, get) => ({
         ...history.slice(0, -1), // 去掉刚加的 user（已放最后）
         { role: 'user', content: text && text.trim() ? text : '（见本次附件）' },
       ];
-      const aiText = await chat(get().settings.modelConfig, messages);
+      const aiText = await chat(get().settings.modelConfig, messages, { signal: gen.signal });
       const aiMsg: Message = { id: uid(), role: 'ai', content: aiText, quotes: hitsToQuotes(hits) };
-      const conv2 = get().conversations.find((c) => c.id === convId)!;
       set({
         conversations: get().conversations.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, aiMsg] } : c)),
         thinking: false,
       });
       void persistConversations(get().conversations);
     } catch (e: any) {
-      const errMsg: Message = { id: uid(), role: 'ai', content: `⚠️ ${e?.message || '请求失败'}`, quotes: [] };
+      // 三种结束方式要给人看三句不同的话。都塞进「请求失败」的话，
+      // 用户主动点了停止却看到一堆红字，会以为是自己操作错了。
+      const content = genStopped
+        ? '⏹ 已停止生成。'
+        : genTimedOut
+          ? `⚠️ 生成超时（超过 ${GEN_TIMEOUT_MS / 1000} 秒还没返回）。可能是网络不通，或模型还在加载 —— 换个网络，或到「我的」里检查一下模型配置。`
+          : `⚠️ ${e?.message || '请求失败'}`;
+      const errMsg: Message = { id: uid(), role: 'ai', content, quotes: [] };
       set({
         conversations: get().conversations.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, errMsg] } : c)),
-        thinking: false, lastError: e?.message || '请求失败',
+        thinking: false,
+        lastError: genStopped ? null : (genTimedOut ? content : e?.message || '请求失败'),
       });
       void persistConversations(get().conversations);
+    } finally {
+      gen.done();
     }
   },
 
   async runCompliance(text, attachments) {
+    if (get().thinking) return; // 同 sendMessage：生成中不接受第二次
     let convId = get().currentConvId;
     if (!convId) { get().newConversation(); convId = get().currentConvId!; }
     const conv = get().conversations.find((c) => c.id === convId)!;
     const userMsg: Message = { id: uid(), role: 'user', content: `【需求符合性检查】${text}`, attachments };
     set({ conversations: get().conversations.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, userMsg] } : c)), thinking: true, lastError: null });
 
+    const gen = beginGeneration();
     try {
-      const hits = await retrieve(text || '', resolveScope(get()));
+      // 逐项核数值比一般问答更吃上下文：少带一段就少判一项，所以下限提到 12。
+      // （这个下限原本是「对比」页那条通路单独设的，两路合并后统一到这里）
+      const scope = resolveScope(get());
+      const hits = await retrieve(text || '', { ...scope, topK: Math.max(scope.topK, 12) });
       set({ lastRetrieval: summarizeHits(hits, get().embeddingTotal) });
       const ctx = buildContext(hits);
       const attText = (attachments || []).filter((a) => a.text).length
         ? '【用户附件】\n' + (attachments || []).filter((a) => a.text).map((a) => `《${a.name}》\n${a.text}`).join('\n\n')
         : '';
       const prompt = compliancePrompt(text + (attText ? '\n\n' + attText : ''), ctx);
-      const raw = await chat(get().settings.modelConfig, [
-        { role: 'system', content: '你是树脂材料选型工程师，只输出合规检查结果 JSON。' },
-        { role: 'user', content: prompt },
-      ]);
+      const raw = await chat(
+        get().settings.modelConfig,
+        [
+          { role: 'system', content: '你是树脂材料选型工程师，只输出合规检查结果 JSON。' },
+          { role: 'user', content: prompt },
+        ],
+        { signal: gen.signal }
+      );
       const result: ComplianceResult | null = parseCompliance(raw);
       const aiMsg: Message = result
         ? { id: uid(), role: 'ai', content: `已对要求逐项比对（详见合规卡片）。\n\n${result.conclusion}`, compliance: result }
@@ -670,45 +814,40 @@ export const useStore = create<State>((set, get) => ({
       });
       void persistConversations(get().conversations);
     } catch (e: any) {
-      const errMsg: Message = { id: uid(), role: 'ai', content: `⚠️ ${e?.message || '合规检查失败'}`, quotes: [] };
+      // 同 sendMessage：停止 / 超时 / 真失败要说三句不同的话
+      const content = genStopped
+        ? '⏹ 已停止生成。'
+        : genTimedOut
+          ? `⚠️ 合规检查超时（超过 ${GEN_TIMEOUT_MS / 1000} 秒还没返回）。逐项比对要读的段落更多，比普通提问慢是正常的 —— 可以换个网络再试。`
+          : `⚠️ ${e?.message || '合规检查失败'}`;
+      const errMsg: Message = { id: uid(), role: 'ai', content, quotes: [] };
       set({
         conversations: get().conversations.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, errMsg] } : c)),
-        thinking: false, lastError: e?.message || '合规检查失败',
+        thinking: false,
+        lastError: genStopped ? null : (genTimedOut ? content : e?.message || '合规检查失败'),
       });
       void persistConversations(get().conversations);
+    } finally {
+      gen.done();
     }
   },
 
-  // 独立「对比」页比对：与 runCompliance 的区别是结果只进 compareResult，不写进任何会话。
-  // 对比页是一个常驻 Tab，把每次比对都塞成一条聊天记录会把会话列表冲垮。
-  async runCompare(text) {
-    const t = (text || '').trim();
-    if (!t) return;
-    set({ compareBusy: true, compareError: null, compareResult: null });
-    try {
-      // 比对要的上下文比问答多：逐项核数值，少带一段就会漏判
-      const scope = resolveScope(get());
-      const hits = await retrieve(t, { ...scope, topK: Math.max(scope.topK, 12) });
-      set({ lastRetrieval: summarizeHits(hits, get().embeddingTotal) });
-      const ctx = buildContext(hits);
-      const prompt = compliancePrompt(t, ctx);
-      const raw = await chat(get().settings.modelConfig, [
-        { role: 'system', content: '你是树脂材料选型工程师，只输出合规检查结果 JSON。' },
-        { role: 'user', content: prompt },
-      ]);
-      const result = parseCompliance(raw);
-      if (!result) {
-        set({ compareBusy: false, compareError: '模型没有返回可解析的 JSON。可在「我的」里换成结构化输出更稳的模型再试。' });
-        return;
-      }
-      set({ compareBusy: false, compareResult: result });
-    } catch (e: any) {
-      set({ compareBusy: false, compareError: e?.message || '比对失败' });
-    }
-  },
+  // 这里以前还有一个 runCompare + clearCompare。它们与 runCompliance 共用同一段提示词、
+  // 同一个 system prompt，唯一区别是结果写进独立的 compareResult（撑起「对比」Tab）而不是会话。
+  // 两个入口干一件事，于是「对比」降级成助手页的模式切换，这条通路合并进 runCompliance：
+  // 结果从此落在会话里，刷新不会丢，导出与会话记录也自动一致。
 
-  clearCompare() {
-    set({ compareResult: null, compareError: null });
+  /**
+   * 停止当前生成。**两条路径都要做**，缺一个就是「点了没反应」：
+   *   · 云端 —— abort 掉 fetch（chat() 里已经把它接上了）
+   *   · 本地 —— llama.rn 的 completion 不认 AbortSignal，得调它自己的 stopCompletion
+   * 这里立刻把 thinking 置回 false：用户点了要有即时反馈，不能等网络回调才解锁界面。
+   */
+  stopGeneration() {
+    genStopped = true;
+    genCtl?.abort();
+    void stopLocalChat();
+    set({ thinking: false });
   },
 
   async updateSettings(patch) {
@@ -746,14 +885,21 @@ export const useStore = create<State>((set, get) => ({
       const entries = await listDir(conn, pw);
       const files = entries.filter((e) => !e.isDir);
       let added = 0;
+      let skipped = 0;
+      // NAS 同步是最容易撞重复的场景：同一个目录同步两次，以前就得到两份一模一样的资料
+      //（每次都新建 uid，既不比名字也不比内容）。按正文指纹判重后，第二次同步是空操作。
+      const seen = new Set(get().documents.map((d) => d.meta?.hash).filter(Boolean) as string[]);
       for (const f of files) {
         try {
           const text = await downloadText(conn, pw, f.href);
           if (!text) continue;
+          const hash = contentHash(text);
+          if (seen.has(hash)) { skipped++; continue; }
+          seen.add(hash);
           const type = extToType(f.name);
           const doc: Document = {
             id: uid(), name: f.name, type, folderId: null, tags: ['NAS'],
-            status: 'indexing', meta: { size: f.size, source: 'nas' }, createdAt: new Date().toISOString(),
+            status: 'indexing', meta: { size: f.size, source: 'nas', hash }, createdAt: new Date().toISOString(),
           };
           await insertDocument(doc);
           const chunks = chunkText(text).map((c) => ({ ...c, docId: doc.id }));
@@ -764,7 +910,13 @@ export const useStore = create<State>((set, get) => ({
           // 单个文件失败不影响其他
         }
       }
-      set({ documents: await getDocuments(), importing: false, lastError: added ? null : 'NAS 上未找到可索引的文本文档（仅支持 TXT/MD 拉取，PDF/Word 暂跳过）。' });
+      // 四种结果要说清，尤其「一份都没新增」要区分「NAS 上没有」和「全都有了」——
+      // 后者是正常的，说成「未找到可索引的文档」会让人以为同步坏了。
+      let note: string | null = null;
+      if (!added && !skipped) note = 'NAS 上未找到可索引的文本文档（仅支持 TXT/MD 拉取，PDF/Word 暂跳过）。';
+      else if (!added && skipped) note = `没有新内容：NAS 上这 ${skipped} 份都已经在库里了。`;
+      else if (skipped) note = `新增 ${added} 份，跳过 ${skipped} 份（库里已有相同内容）。`;
+      set({ documents: await getDocuments(), importing: false, lastError: note });
     } catch (e: any) {
       set({ importing: false, lastError: e?.message || 'NAS 同步失败' });
     }
@@ -850,8 +1002,12 @@ export const useStore = create<State>((set, get) => ({
   },
 
   async setPasscode(code) {
-    currentPasscode = code;
-    await secureSet('app_passcode', code);
+    const c = (code || '').trim();
+    // 新设一律 6 位。校验放在这里而不是只放在界面上：设密码有两个入口
+    //（首次启动的锁屏、「我的」里的改密码），漏一个就会写进一个 4 位密码。
+    if (!/^\d{6}$/.test(c)) throw new Error('密码要 6 位数字');
+    currentPasscode = c;
+    await secureSet('app_passcode', c);
     set({ passcodeSet: true, locked: false });
   },
 
@@ -860,6 +1016,8 @@ export const useStore = create<State>((set, get) => ({
     if (ok) set({ locked: false });
     return ok;
   },
+
+  unlockByBiometric() { set({ locked: false }); },
 
   lock() { set({ locked: true }); },
 }));
