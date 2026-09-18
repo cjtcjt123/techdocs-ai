@@ -327,6 +327,16 @@ export default function ProfileScreen() {
           <Row label="隐私锁（Face ID / 密码）" value={<Switch value={draft.privacy.faceID} onValueChange={(v) => patchPrivacy({ faceID: v })} />} />
           <Row label="离线模式（禁用联网）" value={<Switch value={draft.privacy.offlineMode} onValueChange={(v) => patchPrivacy({ offlineMode: v })} />} />
           <Row label="云端调用需确认" value={<Switch value={draft.privacy.cloudConfirm} onValueChange={(v) => patchPrivacy({ cloudConfirm: v })} />} />
+          <Text style={styles.note}>
+            离线模式：打开后所有联网动作都会直接拦下并说明原因（云端模型、NAS 解析、NAS 同步、语义检索、
+            模型下载）。此时仍可用的组合是「手机本地模型 + 手机本地解析 + 关键词检索」，全程不联网。
+          </Text>
+          <Text style={styles.note}>
+            云端调用需确认：在把资料发出你的网络之前弹窗确认。判定看地址 ——
+            NAS、192.168.x 这类内网地址不会询问（资料没出去）；只有真正对外的地址才拦。
+            已接入这条确认的动作：云端问答、语义检索生成向量、NAS 文档解析。
+          </Text>
+          <Text style={styles.note}>两个开关保存后立即生效，不用重启。</Text>
         </View>
 
         <View style={styles.card}>

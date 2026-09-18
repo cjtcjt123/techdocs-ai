@@ -16,6 +16,7 @@
  *   · 配置了但调用失败 → 抛错，由调用方决定是否吞掉降级。
  */
 import type { EmbeddingConfig } from './settings';
+import { assertOnline, confirmExternal } from './net-guard';
 
 export interface EmbedResult {
   vectors: number[][];
@@ -36,6 +37,8 @@ export interface EmbedOpts extends EmbeddingConfig {
   timeoutMs?: number;
   onProgress?: (done: number, total: number) => void;
   signal?: AbortSignal;
+  /** 「测试连接」用：只发一句探测文本、不含资料，故跳过「云端调用需确认」 */
+  skipConfirm?: boolean;
 }
 
 type Kind = 'nas' | 'openai';
@@ -180,6 +183,19 @@ export async function embedTexts(texts: string[], opts: EmbedOpts): Promise<Embe
   const list = (texts || []).filter((t) => typeof t === 'string' && t.trim().length > 0);
   if (!endpoint || !list.length) return null;
 
+  // 守卫放在这里，而不是 postJson 里：embedTexts 内部按批循环，
+  // 放 postJson 会变成「每批弹一次确认窗」——一批 32 条、几百块资料能弹到你放弃。
+  assertOnline('语义检索（生成向量）');
+  if (!opts.skipConfirm) {
+    const allowed = await confirmExternal(
+      `即将把 ${list.length} 段资料正文发送给嵌入服务以生成向量（语义检索用）。`,
+      endpoint
+    );
+    if (!allowed) {
+      throw new Error('已取消本次嵌入调用（资料未发出）。不想每次都确认，可到「我的 → 隐私与安全」关掉「云端调用需确认」。');
+    }
+  }
+
   const batchSize = Math.max(1, opts.batchSize ?? 32);
   const timeoutMs = opts.timeoutMs ?? 60000;
   const vectors: number[][] = [];
@@ -207,7 +223,8 @@ export async function testEmbedding(cfg: EmbeddingConfig, timeoutMs = 20000): Pr
   if (!endpoint) return { ok: false, message: '还没填嵌入服务地址。' };
   const t0 = Date.now();
   try {
-    const out = await embedTexts(['这是嵌入服务的连通性测试'], { ...cfg, timeoutMs, batchSize: 1 });
+    // skipConfirm：探测只发一句固定文本、不含任何资料，不值得打断用户
+    const out = await embedTexts(['这是嵌入服务的连通性测试'], { ...cfg, timeoutMs, batchSize: 1, skipConfirm: true });
     if (!out) return { ok: false, message: '还没填嵌入服务地址。' };
     return {
       ok: true,

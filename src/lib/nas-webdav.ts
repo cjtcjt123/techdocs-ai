@@ -2,6 +2,7 @@
 // 基于标准 fetch + Basic 鉴权，iOS 与 Web 通用。
 // 注意：Web 预览受浏览器 CORS 与证书限制，连接/同步以真机为准；SMB 留接口占位。
 import type { NasConnection } from '../types';
+import { assertOnline } from './net-guard';
 
 function baseUrl(conn: NasConnection): string {
   const scheme = conn.secure ? 'https' : 'http';
@@ -32,6 +33,15 @@ function authHeader(conn: NasConnection, password: string): Record<string, strin
   return { Authorization: `Basic ${base64(`${conn.user}:${password}`)}` };
 }
 
+// WebDAV 的唯一出口：离线模式在这里一拦到底。
+// 这里刻意【不】接「云端调用需确认」——WebDAV 只有「列目录」和「下载」两个方向，
+// 都是把 NAS 上的文件往手机里拿，不构成资料外发。给读操作也弹确认窗，
+// 只会让人把开关关掉，连真正外发的调用一起失去保护。
+function nasFetch(url: string, init: RequestInit): Promise<Response> {
+  assertOnline('连接 NAS（WebDAV）');
+  return fetch(url, init);
+}
+
 export interface NasEntry {
   name: string;
   href: string;
@@ -42,11 +52,11 @@ export interface NasEntry {
 export async function testConnection(conn: NasConnection, password: string): Promise<{ ok: boolean; message: string }> {
   const url = baseUrl(conn);
   try {
-    const res = await fetch(url, { method: 'PROPFIND', headers: { ...authHeader(conn, password), Depth: '0' } });
+    const res = await nasFetch(url, { method: 'PROPFIND', headers: { ...authHeader(conn, password), Depth: '0' } });
     if (res.status === 401) return { ok: false, message: '鉴权失败（用户名 / 密码错误）' };
     if (res.ok || res.status === 207) return { ok: true, message: `连接成功（HTTP ${res.status}）` };
     // 部分服务器不支持 PROPFIND，退回 GET 探测
-    const res2 = await fetch(url, { method: 'GET', headers: authHeader(conn, password) });
+    const res2 = await nasFetch(url, { method: 'GET', headers: authHeader(conn, password) });
     if (res2.status === 401) return { ok: false, message: '鉴权失败（用户名 / 密码错误）' };
     if (res2.ok) return { ok: true, message: '连接成功' };
     return { ok: false, message: `连接失败（HTTP ${res2.status}）` };
@@ -58,7 +68,7 @@ export async function testConnection(conn: NasConnection, password: string): Pro
 export async function listDir(conn: NasConnection, password: string, subPath = ''): Promise<NasEntry[]> {
   const root = baseUrl(conn).replace(/\/$/, '');
   const url = root + (subPath.startsWith('/') ? subPath : subPath ? '/' + subPath : '');
-  const res = await fetch(url, { method: 'PROPFIND', headers: { ...authHeader(conn, password), Depth: '1' } });
+  const res = await nasFetch(url, { method: 'PROPFIND', headers: { ...authHeader(conn, password), Depth: '1' } });
   if (!res.ok && res.status !== 207) throw new Error(`列目录失败（HTTP ${res.status}）`);
   const xml = await res.text();
   const entries = parsePropfind(xml);
@@ -68,7 +78,7 @@ export async function listDir(conn: NasConnection, password: string, subPath = '
 }
 
 export async function downloadText(conn: NasConnection, password: string, href: string): Promise<string> {
-  const res = await fetch(href, { method: 'GET', headers: authHeader(conn, password) });
+  const res = await nasFetch(href, { method: 'GET', headers: authHeader(conn, password) });
   if (!res.ok) throw new Error(`下载失败（HTTP ${res.status}）`);
   return await res.text();
 }

@@ -2,6 +2,7 @@
 // 官方与 NAS 均走 OpenAI 兼容 /chat/completions；Claude 走 /v1/messages 分支
 import { ModelConfig } from '../types';
 import { localAvailability, localChat, loadedModelId } from './local-llm';
+import { assertOnline, confirmExternal } from './net-guard';
 
 export interface ChatMsg {
   role: 'system' | 'user' | 'assistant';
@@ -97,6 +98,13 @@ export async function testModel(cfg: ModelConfig): Promise<ConnTestResult> {
   const t = resolveTarget(cfg);
   if (!t.baseURL) return { ok: false, ms: 0, detail: '还没填接口地址：选「自定义」时必须填 Base URL。' };
   if (!t.model) return { ok: false, ms: 0, detail: '还没填模型名。' };
+  // 离线模式下直接给出原因。测试连接只发两个字的探测问句、不带任何资料，
+  // 所以这里【不】走「云端确认」—— 为一次不带资料的探测弹窗，只会把确认弹窗变成噪音。
+  try {
+    assertOnline('测试连接');
+  } catch (e: any) {
+    return { ok: false, ms: 0, detail: e?.message || '离线模式下无法测试连接。' };
+  }
 
   const url = joinPath(t.baseURL, t.claude ? '/messages' : '/chat/completions');
   // 不传 max_tokens（部分新模型已改用 max_completion_tokens，传了反而 400）；Claude 则必须传
@@ -152,8 +160,18 @@ export async function chat(cfg: ModelConfig, messages: ChatMsg[]): Promise<strin
     return localChat(messages);
   }
   const t = resolveTarget(cfg);
+  assertOnline('调用云端模型');
   if (!t.baseURL || !t.model) {
     throw new Error('模型未正确配置：请前往「我的 → API 与模型」填写 baseURL 与 model。');
+  }
+  // 这一步才是「云端调用需确认」真正要保护的动作：把检索到的资料正文发出去。
+  // 内网自托管（NAS 上的 Ollama）地址会被判为私有、不弹窗 —— 资料没出用户的网络。
+  const allowed = await confirmExternal(
+    `即将把本次问答检索到的资料正文发送给模型「${t.model}」以生成回答。`,
+    t.baseURL
+  );
+  if (!allowed) {
+    throw new Error('已取消本次云端调用（资料未发出）。不想每次都确认，可到「我的 → 隐私与安全」关掉「云端调用需确认」。');
   }
   if (t.claude) return chatClaude(t, messages);
 

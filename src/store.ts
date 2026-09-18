@@ -26,6 +26,7 @@ import type { Hit } from './lib/rag';
 import { chat, ChatMsg } from './lib/llm';
 import { compliancePrompt, parseCompliance } from './lib/compliance';
 import { loadSettings, saveSettings, AppSettings } from './lib/settings';
+import { setPrivacySwitches, setConfirmHook } from './lib/net-guard';
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
@@ -44,6 +45,10 @@ async function persistConversations(convs: Conversation[]): Promise<void> {
 
 // 内存中保存当前解锁密码（本地 App，足够 MVP；安全存储由 secure-store 落盘）
 let currentPasscode = '';
+
+// 「云端调用需确认」弹窗的挂起回调。放在模块级而不是 state 里：
+// 它是个函数、不参与渲染，放进 state 只会让每次 set 都触发一次无意义的重渲染。
+let confirmResolver: ((ok: boolean) => void) | null = null;
 
 // 内部 Message.role 用 'user' | 'ai'，但 OpenAI 兼容接口只认 'assistant'。
 // 必须显式转换：用 `as` 断言只改类型、不改运行时值，会直接把 'ai' 发出去导致 400。
@@ -144,7 +149,15 @@ interface State {
   cases: CaseRecord[];
   loadCases: () => Promise<void>;
   recordCase: (input: CaseInput) => Promise<CaseRecord | null>;
+  /** 编辑已有案例（保留 id / createdAt / 来源会话） */
+  updateCase: (id: string, input: CaseInput) => Promise<CaseRecord | null>;
+  /** 切换「是否参与问答检索」。关掉后案例仍留在库里，只是不会被召回 */
+  setCaseVerified: (id: string, verified: boolean) => Promise<void>;
   removeCase: (id: string) => Promise<void>;
+
+  // 「云端调用需确认」：有待确认的调用时存放待发内容的说明，界面据此弹窗
+  pendingConfirm: { what: string } | null;
+  answerConfirm: (ok: boolean) => void;
 
   init: () => Promise<void>;
   importFiles: () => Promise<void>;
@@ -181,6 +194,61 @@ interface State {
   lock: () => void;
 }
 
+/**
+ * 把表单输入变成一条完整案例。
+ * base 存在 = 编辑（保留 id / createdAt / 溯源字段）；不存在 = 新建。
+ */
+function materializeCase(input: CaseInput, base?: CaseRecord): CaseRecord {
+  return {
+    id: base?.id ?? uid(),
+    title: (input.title || input.problem || '').trim().slice(0, 80) || base?.title || '（未命名案例）',
+    problem: input.problem?.trim() || undefined,
+    product: input.product?.trim() || undefined,
+    environment: input.environment?.trim() || undefined,
+    docIds: input.docIds?.length ? input.docIds : undefined,
+    aiAdvice: input.aiAdvice || undefined,
+    rootCause: input.rootCause?.trim() || undefined,
+    finalFix: input.finalFix.trim(),
+    outcome: input.outcome,
+    notes: input.notes?.trim() || undefined,
+    tags: input.tags?.length ? input.tags : [],
+    // 用户亲手填了「最终怎么解决的」→ 默认可信。
+    // verified=false 留给两类情形：将来「由 AI 起草、待确认」的路径，
+    // 以及用户主动把某条标成「先别参与检索」（记录留着，但不影响回答）。
+    verified: input.verified ?? base?.verified ?? true,
+    occurredAt: input.occurredAt ?? base?.occurredAt,
+    // 编辑时不能把 createdAt 刷成现在 —— 提示词会让模型引用「根据你 08-12 的记录」，
+    // 改了它就等于篡改了记录日期。
+    createdAt: base?.createdAt ?? new Date().toISOString(),
+    convId: input.convId ?? base?.convId,
+    msgId: input.msgId ?? base?.msgId,
+  };
+}
+
+/**
+ * 案例落库 + 刷新列表 + 作废检索缓存。三个写入口（新增 / 编辑 / 切 verified）共用，
+ * 所以不会有哪条路径漏掉作废。
+ *
+ * 为什么必须显式作废：检索索引按「块数:总字数」做指纹缓存，它覆盖得了新增与删除，
+ * 覆盖不了等长改写（30min → 40min 时指纹一模一样）—— 不显式作废就会出现
+ * 「改完了再问，命中的还是旧内容」。
+ */
+async function commitCase(
+  set: (patch: Partial<State>) => void,
+  get: () => State,
+  rec: CaseRecord
+): Promise<CaseRecord | null> {
+  try {
+    await saveCaseRow(rec);
+    set({ cases: sortCases([rec, ...get().cases.filter((c) => c.id !== rec.id)]) });
+    invalidateRetrievalIndex();
+    return rec;
+  } catch (e: any) {
+    set({ lastError: e?.message || '案例保存失败' });
+    return null;
+  }
+}
+
 export const useStore = create<State>((set, get) => ({
   ready: false,
   documents: [],
@@ -215,8 +283,16 @@ export const useStore = create<State>((set, get) => ({
   compareError: null,
   lastRetrieval: null,
   cases: [],
+  pendingConfirm: null,
 
   async init() {
+    // 把两个隐私开关推给网络层守卫。
+    // 必须在任何请求可能发生【之前】挂好 —— 否则「启动后第一次问答」会绕过确认弹窗，
+    // 而这类漏网只在特定启动顺序下出现，极难复现。
+    setConfirmHook((what) => new Promise<boolean>((resolve) => {
+      confirmResolver = resolve;
+      set({ pendingConfirm: { what } });
+    }));
     await initDB();
     const [docs, settings, pc, nasPw, convRaw] = await Promise.all([
       getDocuments(),
@@ -236,6 +312,7 @@ export const useStore = create<State>((set, get) => ({
     } catch {
       convs = [];
     }
+    setPrivacySwitches(settings.privacy);
     set({
       ready: true,
       documents: docs,
@@ -260,46 +337,40 @@ export const useStore = create<State>((set, get) => ({
   },
 
   /**
-   * 记一条案例。这是经验库【唯一的写入口】——
-   * 校验、标 verified、刷新列表、作废检索缓存四件事都收在这里。
-   * 留一个入口是有意的：以后再加写入路径，很容易漏掉「作废检索缓存」，
-   * 症状是「刚记完又问一遍，案例还是没生效」，而且看起来像检索写错了。
+   * 记一条新案例。经验库的写入口之一（另一个是 updateCase / setCaseVerified）。
+   * 三者共用下面的 commitCase，所以「刷新列表 + 作废检索缓存」不会被漏掉 ——
+   * 漏掉的症状是「刚改完又问一遍，案例还是旧的」，且看起来像检索写错了。
    */
   async recordCase(input) {
     const bad = validateCaseInput(input);
     if (bad) { set({ lastError: bad }); return null; }
-    const rec: CaseRecord = {
-      id: uid(),
-      title: (input.title || input.problem || '').trim().slice(0, 80) || '（未命名案例）',
-      problem: input.problem?.trim() || undefined,
-      product: input.product?.trim() || undefined,
-      environment: input.environment?.trim() || undefined,
-      docIds: input.docIds?.length ? input.docIds : undefined,
-      aiAdvice: input.aiAdvice || undefined,
-      rootCause: input.rootCause?.trim() || undefined,
-      finalFix: input.finalFix.trim(),
-      outcome: input.outcome,
-      notes: input.notes?.trim() || undefined,
-      tags: input.tags?.length ? input.tags : [],
-      // 用户亲手填了「最终怎么解决的」→ 直接算已验证。
-      // verified=false 的草稿位置留给将来「由 AI 起草、待用户确认」的路径。
-      verified: true,
-      occurredAt: input.occurredAt,
-      createdAt: new Date().toISOString(),
-      convId: input.convId,
-      msgId: input.msgId,
-    };
-    try {
-      await saveCaseRow(rec);
-      set({ cases: sortCases([rec, ...get().cases.filter((c) => c.id !== rec.id)]) });
-      // 语料变了必须重建检索索引。指纹机制能覆盖「新增 / 删除」（块数与总字数会变），
-      // 但覆盖不了「改一个等长的字」（30min → 40min 时指纹完全相同），所以这里显式作废。
-      invalidateRetrievalIndex();
-      return rec;
-    } catch (e: any) {
-      set({ lastError: e?.message || '案例保存失败' });
-      return null;
-    }
+    return commitCase(set, get, materializeCase(input));
+  },
+
+  /**
+   * 编辑已有案例。
+   *
+   * 保留 id / createdAt / convId / msgId：这些是「这条记录从哪来」的溯源信息，
+   * 表单里没有、也不该让用户去改。createdAt 尤其不能跟着编辑时间走 ——
+   * 提示词里会让模型引用「根据你 08-12 的记录」，改了时间就等于篡改了记录日期。
+   */
+  async updateCase(id, input) {
+    const base = get().cases.find((c) => c.id === id);
+    if (!base) { set({ lastError: '这条案例已不存在（可能已被删除）' }); return null; }
+    const bad = validateCaseInput(input);
+    if (bad) { set({ lastError: bad }); return null; }
+    const next = materializeCase(input, base);
+    // 表单没动的字段（aiAdvice / docIds）沿用原值，避免一编辑就把当初的上下文弄丢
+    next.aiAdvice = input.aiAdvice !== undefined ? input.aiAdvice : base.aiAdvice;
+    next.docIds = input.docIds !== undefined ? input.docIds : base.docIds;
+    return commitCase(set, get, next);
+  },
+
+  /** 单独切换「是否参与检索」——列表里一键操作，不必走完整表单 */
+  async setCaseVerified(id, verified) {
+    const base = get().cases.find((c) => c.id === id);
+    if (!base) return;
+    await commitCase(set, get, { ...base, verified });
   },
 
   async removeCase(id) {
@@ -635,7 +706,17 @@ export const useStore = create<State>((set, get) => ({
   async updateSettings(patch) {
     const next: AppSettings = { ...get().settings, ...patch };
     set({ settings: next });
+    // 开关一改就立刻生效，不等重启 —— 用户点完「离线模式」马上去提问是常态
+    setPrivacySwitches(next.privacy);
     await saveSettings(next);
+  },
+
+  /** 用户在「云端调用需确认」弹窗上做了选择 */
+  answerConfirm(ok) {
+    const r = confirmResolver;
+    confirmResolver = null;
+    set({ pendingConfirm: null });
+    r?.(ok);
   },
 
   // 保存 NAS 连接（密码单独落 secure 层）

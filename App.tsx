@@ -14,6 +14,7 @@ import DocDetailScreen from './src/screens/DocDetailScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import ModelsScreen from './src/screens/ModelsScreen';
 import LockScreen from './src/components/LockScreen';
+import ConfirmCloudModal from './src/components/ConfirmCloudModal';
 import TabGlyph, { GlyphName } from './src/components/TabGlyph';
 import { colors, mono } from './src/theme';
 import { useStore } from './src/store';
@@ -118,19 +119,24 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-      <NavigationContainer>
-        <Stack.Navigator id="root">
-          <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
-          {/* 「我的」放在 Stack 里（不是 Tab）：4 个 Tab 才不挤，而且 push 进来自带返回箭头。
-              入口在工作台顶栏的「设置」胶囊；旧的 navigate('Profile') 依旧有效（会冒泡到父 Stack）。 */}
-          <Stack.Screen name="Profile" component={ProfileScreen} options={{ title: '我的' }} />
-          <Stack.Screen name="DocDetail" component={DocDetailScreen} options={{ title: '文档详情' }} />
-          <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: '更多设置' }} />
-          {/* 本地模型管理：从「我的 → 手机本地模型」进。单独一屏而不是塞进设置里 ——
-              这里要下载 GB 级文件、要逐项删除确认，塞进设置页会又长又难用。 */}
-          <Stack.Screen name="Models" component={ModelsScreen} options={{ title: '手机本地模型' }} />
-        </Stack.Navigator>
-      </NavigationContainer>
+      <View style={{ flex: 1 }}>
+        <NavigationContainer>
+          <Stack.Navigator id="root">
+            <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
+            {/* 「我的」放在 Stack 里（不是 Tab）：4 个 Tab 才不挤，而且 push 进来自带返回箭头。
+                入口在工作台顶栏的「设置」胶囊；旧的 navigate('Profile') 依旧有效（会冒泡到父 Stack）。 */}
+            <Stack.Screen name="Profile" component={ProfileScreen} options={{ title: '我的' }} />
+            <Stack.Screen name="DocDetail" component={DocDetailScreen} options={{ title: '文档详情' }} />
+            <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: '更多设置' }} />
+            {/* 本地模型管理：从「我的 → 手机本地模型」进。单独一屏而不是塞进设置里 ——
+                这里要下载 GB 级文件、要逐项删除确认，塞进设置页会又长又难用。 */}
+            <Stack.Screen name="Models" component={ModelsScreen} options={{ title: '手机本地模型' }} />
+          </Stack.Navigator>
+        </NavigationContainer>
+        {/* 全局确认弹窗：同层里排在导航之后 = 盖在最上层。
+            任何页面发起的云端调用都弹到它，不需要每页各挂一个（漏一页就等于漏一条外发路径）。 */}
+        <ConfirmCloudModal />
+      </View>
       <StatusBar style="dark" />
     </SafeAreaProvider>
   );

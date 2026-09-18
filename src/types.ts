@@ -111,6 +111,12 @@ export interface CaseInput {
   occurredAt?: string;
   convId?: string;
   msgId?: string;
+  /**
+   * 是否参与问答检索。
+   * 用户亲手填的案例一律为 true；编辑时可以手动关掉（相当于存成「草稿 / 先别用这条」）。
+   * 这个开关就是检索的门禁 —— 关掉后案例仍留在库里可查，但不会被召回。
+   */
+  verified?: boolean;
 }
 
 export type ModelSource = 'api' | 'local';

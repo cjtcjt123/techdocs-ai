@@ -23,6 +23,47 @@ export function complianceToCsv(r: ComplianceResult): string {
   return [head, ...rows, '', `结论,${csvCell(r.conclusion)},模型,${csvCell(r.model)}`].join('\n');
 }
 
+/**
+ * 符合性检查 → Markdown 表格。
+ *
+ * 与 complianceToCsv 是同一份数据的两种排版，共用「导出格式」这个设置项：
+ * 贴进飞书 / 邮件用 Markdown 顺手，导进 Excel 用 CSV。两种都要，但不必都默认。
+ */
+export function complianceToMarkdown(r: ComplianceResult): string {
+  // 单元格里的 | 必须转义，否则列数会被内容撑歪（型号名、备注里带 | 是真实存在的）
+  const cell = (s: string) => String(s ?? '').replace(/\|/g, '\\|').replace(/\n+/g, ' ');
+  const verdict = (v: string) => (v === 'ok' ? '满足' : v === 'warn' ? '差一点' : '不满足');
+  const lines = [
+    `| 项目 | 要求 | 实际 | 判定 | 来源 |`,
+    `| --- | --- | --- | --- | --- |`,
+    ...r.items.map(
+      (it) =>
+        `| ${cell(it.item)} | ${cell(it.required)} | ${cell(it.actual)} | ${verdict(it.verdict)} | ${cell(it.source || '')} |`
+    ),
+    '',
+    `**结论**：${r.conclusion}`,
+    '',
+    `模型：${r.model}`,
+  ];
+  return lines.join('\n');
+}
+
+export type ExportFormat = 'markdown' | 'csv';
+
+/**
+ * 按用户选定的格式产出符合性检查文本。
+ *
+ * 存在的意义：格式判断只能有一处。调用方各判一次，迟早有一处漏判 ——
+ * 症状是「设置里改了格式，某个入口还是老样子」，也就是当初那个「空壳开关」。
+ * 顺带说明为什么没有 PDF：手机上生成 PDF 需要引入排版/字体子系统（新依赖 + 拖累出包流水线），
+ * 而「分享面板 → 打印 → 存为 PDF」在 iOS 上本来就能一步得到 PDF，不值得为此加依赖。
+ */
+export function complianceToFormat(r: ComplianceResult, fmt: ExportFormat): { text: string; ext: 'md' | 'csv' } {
+  return fmt === 'markdown'
+    ? { text: complianceToMarkdown(r), ext: 'md' }
+    : { text: complianceToCsv(r), ext: 'csv' };
+}
+
 export function convToMarkdown(c: Conversation, title: string): string {
   const lines: string[] = [`# ${title}`, '', `> 导出时间：${new Date().toLocaleString()}`, ''];
   c.messages.forEach((m) => {

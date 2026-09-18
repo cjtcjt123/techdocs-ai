@@ -36,7 +36,14 @@ export interface AppSettings {
   parseService?: ParseServiceConfig; // PDF 高精度解析服务
   embedding?: EmbeddingConfig; // 语义检索用的嵌入服务
   privacy: PrivacySettings;
-  exportFormat: 'markdown' | 'csv' | 'pdf';
+  /**
+   * 符合性检查结果的导出格式。
+   *
+   * 没有 'pdf'：手机上生成 PDF 要引入排版/字体子系统（新依赖 + 拖累出包流水线），
+   * 而 iOS 分享面板里「打印 → 存储为 PDF」本来就能一步得到 PDF。做不到的选项不摆在界面上 ——
+   * 摆着就是一个「改了没反应」的空壳开关，而这个项目已经吃过这个亏。
+   */
+  exportFormat: 'markdown' | 'csv';
   retrieval: RetrievalConfig; // 检索范围与条数（问答时可快速调整）
   /** 本地模型下载是否走国内镜像（hf-mirror）。默认走 —— 直连 huggingface.co 在国内大概率超时 */
   localMirror?: boolean;
@@ -65,9 +72,13 @@ export async function loadSettings(): Promise<AppSettings> {
     const mc = parsed.modelConfig || {};
     // 归一化旧来源值：'official' / 'nas' 并入 'api'，避免 UI 出现「未选中」
     const normalizedSource: ModelSource = mc.source === 'local' ? 'local' : 'api';
+    // 旧版本里导出格式有 'pdf' 选项（实际做不到）。存量设置里可能存着 'pdf'，
+    // 不归一化的话界面三个分段全部未选中，而导出会静默按 CSV 走 —— 又是一个「设置没反应」。
+    const exportFormat = parsed.exportFormat === 'csv' ? 'csv' : 'markdown';
     return {
       ...defaultSettings(),
       ...parsed,
+      exportFormat,
       modelConfig: { ...defaultSettings().modelConfig, ...mc, source: normalizedSource, apiKey },
       nas: parsed.nas ? { ...parsed.nas, user: parsed.nas.user || '' } : undefined,
       privacy: { ...defaultSettings().privacy, ...(parsed.privacy || {}) },

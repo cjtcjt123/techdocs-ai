@@ -7,6 +7,7 @@
  *
  * 服务端代码与部署方式见项目内 `nas-parse/` 目录。
  */
+import { assertOnline, confirmExternal } from './net-guard';
 
 export interface NasParseResult {
   text: string;
@@ -26,6 +27,10 @@ const trimUrl = (u: string) => u.trim().replace(/\/+$/, '');
 
 /** 带超时的 fetch（AbortController 在 RN 与浏览器都可用） */
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  // 离线模式拦在最后一层：这个函数是解析服务所有请求的唯一出口，
+  // 放在这里就不会有「新加了一个接口忘了拦」的漏网。
+  // 注意只拦 offline，不在这里拦「云端确认」—— /health 探测不带资料，不该弹窗。
+  assertOnline('文档解析服务');
   const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null;
   try {
@@ -51,6 +56,13 @@ export async function parseViaNas(
 ): Promise<NasParseResult> {
   const base = trimUrl(endpoint);
   if (!base) throw new Error('未配置解析服务地址');
+
+  // 这一步会把【整份文档的字节】发出去，所以要走「云端调用需确认」。
+  // 内网地址（192.168.x / NAS 机器名等）会被判为私有、不弹窗 —— 资料没出用户的网络。
+  const allowed = await confirmExternal(`即将把《${name}》的完整文件发送给文档解析服务（${base}）。`, base);
+  if (!allowed) {
+    throw new Error('已取消本次 NAS 解析（文件未发出）。可改用手机本地解析，或到「我的 → 隐私与安全」关掉「云端调用需确认」。');
+  }
 
   const res = await fetchWithTimeout(
     `${base}/parse?name=${encodeURIComponent(name)}`,

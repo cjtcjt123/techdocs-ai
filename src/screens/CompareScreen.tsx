@@ -5,13 +5,13 @@ import React, { useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useStore } from '../store';
 import ComplianceTable from '../components/ComplianceTable';
-import { complianceToCsv, shareText } from '../lib/export';
+import { complianceToFormat, shareText } from '../lib/export';
 import { colors, mono, radius, shadow, space } from '../theme';
 
 const EXAMPLE = '拉挤工艺用环氧树脂：\n弯曲强度 ≥ 110 MPa\n拉伸强度 ≥ 75 MPa\n热变形温度 ≥ 130 °C\n适用期（25°C）≥ 90 min\n粘度 8 000–15 000 mPa·s';
 
 export default function CompareScreen() {
-  const { compareResult, compareBusy, compareError, runCompare, clearCompare, documents } = useStore();
+  const { compareResult, compareBusy, compareError, runCompare, clearCompare, documents, settings } = useStore();
   const [req, setReq] = useState('');
   const [msg, setMsg] = useState('');
 
@@ -131,10 +131,13 @@ export default function CompareScreen() {
           <Pressable
             style={s.sumBtn}
             onPress={async () => {
-              setMsg(await shareText(`符合性检查-${compareResult.model}`, complianceToCsv(compareResult)));
+              // 按「我的 → 更多设置 → 导出格式」走（与问答页共用同一个 dispatcher，
+              // 两处各判一次格式早晚分叉；导出过的表头不一致是会被用户抓到的）
+              const out = complianceToFormat(compareResult, settings.exportFormat);
+              setMsg(await shareText(`符合性检查-${compareResult.model}`, out.text));
             }}
           >
-            <Text style={s.sumBtnT}>导出</Text>
+            <Text style={s.sumBtnT}>导出 {settings.exportFormat === 'markdown' ? 'MD' : 'CSV'}</Text>
           </Pressable>
         </View>
       ) : null}

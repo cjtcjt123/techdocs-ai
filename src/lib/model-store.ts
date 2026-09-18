@@ -8,6 +8,7 @@
 // web 端由 model-store.web.ts 通过 Metro 平台后缀自动替换。
 import { Directory, File, Paths } from 'expo-file-system';
 import * as DocumentPicker from 'expo-document-picker';
+import { assertOnline } from './net-guard';
 import {
   formatBytes,
   parseGgufHeader,
@@ -144,6 +145,8 @@ export async function listLocalModels(): Promise<LocalModelRecord[]> {
 /** 用下载目标文件的实时大小当进度 —— expo-file-system 的下载接口没有进度回调，
  *  但目标文件是边下边落盘的，轮询它的大小就是真实进度（不是假动画）。 */
 async function downloadTo(url: string, fileName: string, totalHint: number, onProgress?: ProgressFn): Promise<File> {
+  // 模型下载是纯外网拉取、不含资料，所以只受「离线模式」拦，不接「云端确认」
+  assertOnline('下载本地模型');
   const dest = new File(modelsDir(), fileName);
 
   // 空间预检：留 300 MB 余量，避免下到 99% 时写失败
