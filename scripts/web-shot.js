@@ -42,19 +42,26 @@ async function findPageTarget() {
 }
 
 // 可点击元素：RN web 的 Pressable 监听 pointerdown/pointerup，只发 click 不一定触发
-const clickExpr = (text) => `(() => {
-  const t = ${JSON.stringify(text)};
+// 文本带 "|all" 后缀时点击所有命中项（用于同名按钮，如页面上有两个「测试连接」）
+const clickExpr = (text) => {
+  const all = text.endsWith('|all');
+  const t = all ? text.slice(0, -4) : text;
+  return `(() => {
+  const t = ${JSON.stringify(t)};
   const cands = Array.from(document.querySelectorAll('[role="button"], button, a, [tabindex]'));
-  const el = cands.find(e => (e.innerText || '').trim() === t)
-          || cands.find(e => (e.innerText || '').includes(t));
-  if (!el) return 'NOT_FOUND';
-  const r = el.getBoundingClientRect();
-  const opts = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-  ['pointerdown', 'pointerup', 'click'].forEach(type => {
-    el.dispatchEvent(new MouseEvent(type, opts));
-  });
+  const hits = cands.filter(e => (e.innerText || '').trim() === t);
+  const els = hits.length ? hits : cands.filter(e => (e.innerText || '').includes(t));
+  if (!els.length) return 'NOT_FOUND';
+  const fire = (el) => {
+    const r = el.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    ['pointerdown', 'pointerup', 'click'].forEach(type => el.dispatchEvent(new MouseEvent(type, opts)));
+  };
+  if (${all}) { els.forEach(fire); return 'CLICKED_ALL:' + els.length; }
+  fire(els[0]);
   return 'CLICKED';
 })()`;
+};
 
 async function main() {
   const target = await findPageTarget();
@@ -101,7 +108,14 @@ async function main() {
   await send('Runtime.enable');
   await send('Log.enable');
   await send('Page.enable');
-  await send('Emulation.setDeviceMetricsOverride', { width: 430, height: 932, deviceScaleFactor: 2, mobile: true });
+  await send('Emulation.setDeviceMetricsOverride', {
+    // 视口可用环境变量覆盖，便于同一脚本同时验证手机版与桌面版：
+    //   CDP_W=1280 CDP_H=1000 CDP_MOBILE=0 node scripts/web-shot.js <url> <前缀>
+    width: Number(process.env.CDP_W || 430),
+    height: Number(process.env.CDP_H || 932),
+    deviceScaleFactor: 2,
+    mobile: (process.env.CDP_MOBILE || '1') === '1',
+  });
 
   await send('Page.navigate', { url: URL_ });
   await sleep(WAIT);
@@ -121,8 +135,26 @@ async function main() {
   };
 
   console.log(`=== 第 1 屏：${URL_} ===`);
+  // 长页面验证：内容由 JS 渲染时 URL 锚点不生效，改用选择器主动滚动。
+  //   CDP_SCROLL="#groups" node scripts/web-shot.js <url> <前缀>
+  if (process.env.CDP_SCROLL) {
+    const isBottom = process.env.CDP_SCROLL === '__bottom__';
+    const sel = JSON.stringify(process.env.CDP_SCROLL);
+    const expr = isBottom
+      // RN web 的 ScrollView 是自己带 overflow 的 div，window.scrollTo 不管用，得挨个找
+      ? `(() => {
+          const els = [document.scrollingElement, ...document.querySelectorAll('*')]
+            .filter(e => e && e.scrollHeight > e.clientHeight + 20);
+          els.forEach(e => { e.scrollTop = e.scrollHeight; });
+          return 'SCROLLED_BOTTOM:' + els.length;
+        })()`
+      : `(() => { const el = document.querySelector(${sel}); if (!el) return 'NOT_FOUND'; el.scrollIntoView({ block: 'start' }); return 'SCROLLED'; })()`;
+    const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true });
+    console.log(`[scroll ${process.env.CDP_SCROLL}] ${r?.result?.value}`);
+    await sleep(800);
+  }
   await shoot(`${OUT_PREFIX}-0.png`);
-  console.log((await visible()).slice(0, 500) || '(空)');
+  console.log((await visible()).slice(0, 1200) || '(空)');
 
   for (let i = 0; i < CLICKS.length; i++) {
     const label = CLICKS[i];
@@ -131,7 +163,7 @@ async function main() {
     await sleep(2500);
     console.log(`\n=== 点击「${label}」（${state}）后 ===`);
     await shoot(`${OUT_PREFIX}-${i + 1}.png`);
-    console.log((await visible()).slice(0, 500) || '(空)');
+    console.log((await visible()).slice(0, 1200) || '(空)');
   }
 
   console.log('\n=== 控制台输出 / 异常 ===');

@@ -41,7 +41,7 @@ export default function SettingsScreen() {
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>关于</Text>
-        <Text style={styles.row}>技术资料 AI 助手 · MVP-0</Text>
+        <Text style={styles.row}>京美AI助手 · MVP-0</Text>
         <Text style={styles.note}>架构：手机本地存储 + 官方 API / NAS 后端 / 手机本地三源模型（C 方案）。本地离线模型与 NAS 同步为后续迭代。</Text>
       </View>
     </ScrollView>

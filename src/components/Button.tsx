@@ -57,14 +57,14 @@ export default function Button({ label, variant = 'primary', onPress, disabled, 
 
 const styles = StyleSheet.create({
   base: {
-    borderRadius: radius.sm,
-    paddingVertical: space.s2 - 3,
+    borderRadius: radius.md,
+    paddingVertical: 11,
     paddingHorizontal: space.s3,
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  label: { fontSize: 14, fontWeight: '600' },
+  label: { fontSize: 13.5, fontWeight: '600' },
   pressed: { opacity: 0.85, transform: [{ scale: 0.98 }] },
   disabled: { opacity: 0.4 },
 });
