@@ -135,6 +135,15 @@ export async function getAllChunksForIndex(): Promise<
   }));
 }
 
+// 语料指纹（见 storage.ts 同名函数的注释：口径是 Σ(长度 + 1)）。
+// web 端没有 SQL，但同样不必为了两个数字去 map 出一整个新数组。
+export async function getChunksFingerprint(): Promise<{ count: number; chars: number }> {
+  const cs = load().chunks;
+  let chars = 0;
+  for (const c of cs) chars += (c.content || '').length + 1;
+  return { count: cs.length, chars };
+}
+
 // 取指定文档的文本块 —— 「钉住文档」自动带入上下文时用
 export async function getChunksByDocs(docIds: string[], limit = 12): Promise<any[]> {
   if (!docIds.length) return [];

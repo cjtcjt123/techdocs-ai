@@ -3,6 +3,7 @@ import { View, Text, ScrollView, StyleSheet, Switch, Pressable, TextInput } from
 import { colors, mono, radius, shadow, space } from '../theme';
 import Button from '../components/Button';
 import { useStore } from '../store';
+import { useShallow } from 'zustand/react/shallow';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { ModelSource, DataStrategy, Provider, ModelConfig, NasConnection } from '../types';
@@ -12,6 +13,7 @@ import { testParseService } from '../lib/nas-parse';
 import { testModel, type ConnTestResult } from '../lib/llm';
 import { testEmbedding, resetEmbeddingProbe } from '../lib/embedding';
 import { localAvailability, loadedModelId } from '../lib/local-llm';
+import { biometricInfo, type BiometricInfo } from '../lib/biometric';
 import { MODEL_CATALOG } from '../lib/local-models';
 
 const sources: { key: ModelSource; label: string }[] = [
@@ -33,16 +35,42 @@ const strategies: { key: DataStrategy; label: string }[] = [
 ];
 
 export default function ProfileScreen() {
+  // 同 ChatScreen：只订阅本屏用到的字段。这一屏的收益最大 ——
+  // 它不关心 thinking / 消息 / 文档列表，裸订阅时那边每动一下它都要整屏重渲染，
+  // 而屏幕上正在编辑的 draft 是本地 state、不会因此丢失，只会白白掉帧。
   const {
     settings, updateSettings, saveNas, lock, nasPassword,
     embeddingCount, embeddingTotal, embeddingBusy, embeddingProgress,
     refreshEmbeddingStats, rebuildEmbeddings,
-  } = useStore();
+  } = useStore(
+    useShallow((s) => ({
+      settings: s.settings,
+      updateSettings: s.updateSettings,
+      saveNas: s.saveNas,
+      lock: s.lock,
+      nasPassword: s.nasPassword,
+      embeddingCount: s.embeddingCount,
+      embeddingTotal: s.embeddingTotal,
+      embeddingBusy: s.embeddingBusy,
+      embeddingProgress: s.embeddingProgress,
+      refreshEmbeddingStats: s.refreshEmbeddingStats,
+      rebuildEmbeddings: s.rebuildEmbeddings,
+    }))
+  );
   const navigation = useNavigation<NativeStackNavigationProp<any>>();
   // 草稿态：所有改动先落在 draft，点「保存」才落盘 + 提示成功
   const [draft, setDraft] = useState<AppSettings>(settings);
   const [saved, setSaved] = useState(false);
   const mc = draft.modelConfig;
+
+  // 「服务与后端」默认收起：NAS / 解析 / 嵌入这三个地址配一次基本不再动，
+  // 而这一页进了底栏之后是天天要扫一眼的地方，不该先翻过三个地址栏才看见隐私设置。
+  const [showServices, setShowServices] = useState(false);
+
+  // 本机面容能不能用。不提前查的话，「用面容解锁」这个开关打开后没反应 ——
+  // 那正是上一版的样子（标签写着 Face ID，背后没有一行生物识别代码）。
+  const [bio, setBio] = useState<BiometricInfo | null>(null);
+  useEffect(() => { void biometricInfo().then(setBio); }, []);
 
   // 本地模型可用性与加载状态。web / Expo Go 下 localAvailability() 回报不可用并给出原因，
   // 不抛异常 —— 这样整屏照常打开，本地项显示成「不可用 + 为什么」，其余来源不受影响。
@@ -116,6 +144,13 @@ export default function ProfileScreen() {
     setPsTesting(false);
   };
 
+  // 折叠头右边那行摘要：不展开也知道三个服务各自配成什么样了
+  const servicesSummary = [
+    draft.dataStrategy === 'local' ? null : nasForm?.host ? 'NAS ✓' : 'NAS 未配',
+    settings.parseService?.endpoint ? '解析 ✓' : '解析 未配',
+    embeddingTotal ? `索引 ${embeddingCount}/${embeddingTotal}` : '索引 未建',
+  ].filter(Boolean).join(' · ');
+
   const patchModel = (p: Partial<ModelConfig>) =>
     setDraft((d) => ({ ...d, modelConfig: { ...d.modelConfig, ...p } }));
   const patchPrivacy = (p: Partial<PrivacySettings>) =>
@@ -173,6 +208,14 @@ export default function ProfileScreen() {
 
   return (
     <View style={styles.wrap}>
+      {/* 自绘标题栏：这一页现在是底栏的第三格，不再有 Stack 的 header。
+          「保存」从页尾搬到右上角 —— 设置项铺满一屏，非要滚到底才能保存太别扭。 */}
+      <View style={styles.hd}>
+        <Text style={styles.hdTitle}>我的</Text>
+        <Pressable style={styles.saveTop} onPress={onSave}>
+          <Text style={styles.saveTopT}>保存</Text>
+        </Pressable>
+      </View>
       <ScrollView contentContainerStyle={styles.container}>
         <View style={styles.card}>
           <Text style={styles.cardTitle}>模型来源</Text>
@@ -181,44 +224,60 @@ export default function ProfileScreen() {
             <Text style={[styles.note, !local.available && { color: colors.muted }]}>{localNote}</Text>
           )}
           {mc.source === 'api' && <Text style={styles.note}>云端或自托管模型均走统一接口。家里 NAS 上的 Ollama 选「自定义」并填后端地址（如 http://192.168.0.xxx:11434/v1）即可。</Text>}
-          {/* 入口常显、不只在选中「手机本地」时出现：合理的顺序是「先下载 → 再切来源」，
+          {/* 这个入口常显、不只在选中「手机本地」时出现：合理的顺序是「先下载 → 再切来源」，
               若只在选中后才露出，用户会先切过去再被提示「还没加载」，白跑一趟。 */}
           <Pressable style={styles.linkRow} onPress={() => navigation.navigate('Models')}>
             <Text style={styles.linkText}>📦 手机本地模型（下载 / 导入 / 加载）</Text>
           </Pressable>
         </View>
 
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>供应商</Text>
-          {seg(providers, mc.provider || 'openai', (k) => patchModel({ provider: k }))}
-        </View>
+        {/* ★ 关键分岔：选了「手机本地」，就不该再出现供应商、模型名、API Key、测试连接这一整套。
+            它们只对云端接口有意义，摆在本机推理旁边等于界面在说一件不成立的事 ——
+            上一版就是这么干的：两张卡无条件渲染，只藏了「API Key」一个字段。 */}
+        {mc.source === 'api' ? (
+          <>
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>供应商</Text>
+              {seg(providers, mc.provider || 'openai', (k) => patchModel({ provider: k }))}
+            </View>
 
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>API 配置</Text>
-          {mc.provider === 'custom' && (
-            <Field label="Base URL" placeholder="https://... 或 http://nas:11434/v1" value={mc.baseURL || ''} onChange={(v) => patchModel({ baseURL: v })} />
-          )}
-          <Field label="模型名" placeholder={mc.provider === 'deepseek' ? 'deepseek-chat' : 'gpt-4o-mini'} value={mc.model || ''} onChange={(v) => patchModel({ model: v })} />
-          {mc.source !== 'local' && (
-            <Field label="API Key" placeholder="sk-..." secure value={mc.apiKey || ''} onChange={(v) => patchModel({ apiKey: v })} />
-          )}
-          <Text style={styles.note}>API Key 仅存于本机 secure-store，不上传。NAS 后端可由你在服务端代理官方 Key，进一步降低泄露面。</Text>
-          <View style={styles.btnRow}>
-            <Button
-              label={testingModel ? '测试中…' : '测试连接'}
-              variant="soft"
-              disabled={testingModel}
-              onPress={onTestModel}
-              style={styles.btnHalf}
-            />
-            <Button label="保存配置" onPress={onSave} style={styles.btnHalf} />
-          </View>
-          {modelTest && (
-            <Text style={[styles.note, { color: modelTest.ok ? colors.green : colors.red }]}>
-              {modelTest.ok ? '✅ ' : '⚠️ '}{modelTest.detail}
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>API 配置</Text>
+              {mc.provider === 'custom' && (
+                <Field label="Base URL" placeholder="https://... 或 http://nas:11434/v1" value={mc.baseURL || ''} onChange={(v) => patchModel({ baseURL: v })} />
+              )}
+              <Field label="模型名" placeholder={mc.provider === 'deepseek' ? 'deepseek-chat' : 'gpt-4o-mini'} value={mc.model || ''} onChange={(v) => patchModel({ model: v })} />
+              <Field label="API Key" placeholder="sk-..." secure value={mc.apiKey || ''} onChange={(v) => patchModel({ apiKey: v })} />
+              <Text style={styles.note}>API Key 只落在本机 keychain（浏览器预览下退化为 localStorage），不上传。NAS 后端可由你在服务端代理官方 Key，进一步降低泄露面。</Text>
+              <Button
+                label={testingModel ? '测试中…' : '测试连接'}
+                variant="soft"
+                disabled={testingModel}
+                onPress={onTestModel}
+                style={styles.testBtn}
+              />
+              {modelTest && (
+                <Text style={[styles.note, { color: modelTest.ok ? colors.green : colors.red }]}>
+                  {modelTest.ok ? '✅ ' : '⚠️ '}{modelTest.detail}
+                </Text>
+              )}
+            </View>
+          </>
+        ) : (
+          <View style={[styles.card, styles.cardAccent]}>
+            <Text style={styles.cardTitle}>本机推理 <Text style={styles.tag}>不出手机</Text></Text>
+            {loadedName ? (
+              <Row label="当前模型" value={<Text style={styles.rowVal}>{loadedName}</Text>} />
+            ) : (
+              <Text style={styles.note}>
+                还没加载本地模型 —— 先到「手机本地模型」里下载或导入一个 .gguf，加载后这里才切得过来。
+              </Text>
+            )}
+            <Text style={styles.note}>
+              整套推理在本机完成，资料与提问都不出手机，也不会产生接口费用。
             </Text>
-          )}
-        </View>
+          </View>
+        )}
 
         <View style={styles.card}>
           <Text style={styles.cardTitle}>数据策略</Text>
@@ -230,6 +289,25 @@ export default function ProfileScreen() {
           </Text>
         </View>
 
+        {/* 服务类配置收成一组，默认收起：NAS / 解析 / 嵌入这三个地址配一次基本不再动，
+            而这一页进了底栏之后是天天扫一眼的地方，不该先翻过三个地址栏才看见隐私设置。 */}
+        <Pressable style={styles.card} onPress={() => setShowServices((v) => !v)}>
+          <View style={styles.foldHd}>
+            <Text style={styles.foldT}>服务与后端</Text>
+            <View style={styles.foldRight}>
+              <Text style={styles.foldN}>{servicesSummary}</Text>
+              <Text style={styles.foldChev}>{showServices ? '▾' : '▸'}</Text>
+            </View>
+          </View>
+          {!showServices && (
+            <Text style={styles.note}>
+              不配也能用，只是全在手机上跑 —— 解析保守一些、检索只有关键词。
+            </Text>
+          )}
+        </Pressable>
+
+        {showServices && (
+          <>
         {draft.dataStrategy !== 'local' && (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>NAS 连接</Text>
@@ -322,9 +400,35 @@ export default function ProfileScreen() {
           </Text>
         </View>
 
+          </>
+        )}
+
         <View style={styles.card}>
           <Text style={styles.cardTitle}>隐私与安全</Text>
-          <Row label="隐私锁（Face ID / 密码）" value={<Switch value={draft.privacy.faceID} onValueChange={(v) => patchPrivacy({ faceID: v })} />} />
+          {/* 这个开关以前叫「隐私锁（Face ID / 密码）」—— 名字里写着 Face ID，背后一行生物识别代码都没有，
+              只有 4 位密码。现在拆成两个开关，一个只管锁不锁、一个只管用不用面容，说什么就是什么。 */}
+          <Row label="启动时锁定" value={<Switch value={draft.privacy.lock} onValueChange={(v) => patchPrivacy({ lock: v })} />} />
+          {draft.privacy.lock && (
+            <>
+              <Row
+                label={`用${bio?.label || '面容'}解锁`}
+                value={
+                  <Switch
+                    value={draft.privacy.biometric && !!bio?.available}
+                    disabled={!bio?.available}
+                    onValueChange={(v) => patchPrivacy({ biometric: v })}
+                  />
+                }
+              />
+              <Text style={[styles.note, !bio?.available && { color: colors.muted }]}>
+                {bio === null
+                  ? '正在读取本机的面容 / 指纹状态…'
+                  : bio.available
+                    ? `已就绪。启动时自动刷一次${bio.label}，认不出来再落到密码（6 位）。`
+                    : bio.reason}
+              </Text>
+            </>
+          )}
           <Row label="离线模式（禁用联网）" value={<Switch value={draft.privacy.offlineMode} onValueChange={(v) => patchPrivacy({ offlineMode: v })} />} />
           <Row label="云端调用需确认" value={<Switch value={draft.privacy.cloudConfirm} onValueChange={(v) => patchPrivacy({ cloudConfirm: v })} />} />
           <Text style={styles.note}>
@@ -336,7 +440,7 @@ export default function ProfileScreen() {
             NAS、192.168.x 这类内网地址不会询问（资料没出去）；只有真正对外的地址才拦。
             已接入这条确认的动作：云端问答、语义检索生成向量、NAS 文档解析。
           </Text>
-          <Text style={styles.note}>两个开关保存后立即生效，不用重启。</Text>
+          <Text style={styles.note}>开关保存后立即生效，不用重启。</Text>
         </View>
 
         <View style={styles.card}>
@@ -347,8 +451,6 @@ export default function ProfileScreen() {
             <Text style={[styles.linkText, { color: colors.red }]}>🔒 立即锁定</Text>
           </Pressable>
         </View>
-
-        <Button label="保存" onPress={onSave} style={styles.saveBtn} />
       </ScrollView>
 
       {saved && (
@@ -380,10 +482,25 @@ function Field({ label, placeholder, value, onChange, secure }: { label: string;
 
 const styles = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: colors.background },
-  container: { padding: space.s3, backgroundColor: colors.background, flexGrow: 1 },
+  // 自绘标题栏：这一页是底栏的第三格，没有系统 header
+  hd: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: space.s3, paddingTop: space.s3, paddingBottom: space.s1, backgroundColor: colors.background },
+  hdTitle: { fontSize: 26, fontWeight: '700', color: colors.text, letterSpacing: -0.8 },
+  saveTop: { backgroundColor: colors.primarySoft, borderRadius: radius.md, paddingVertical: 8, paddingHorizontal: 14 },
+  saveTopT: { fontSize: 12.5, fontWeight: '700', color: colors.primaryDeep },
+  container: { padding: space.s3, paddingTop: space.s2, backgroundColor: colors.background, flexGrow: 1 },
   title: { fontSize: 26, fontWeight: '700', color: colors.text, letterSpacing: -0.8, marginBottom: space.s2 },
   card: { backgroundColor: colors.card, borderRadius: radius.xl, padding: 14, marginBottom: space.s1 + 2, ...shadow.card },
+  // 「本机推理」那张卡换底色与描边：它和 API 配置是互斥的两条路，颜色上就该看出是「另一条」
+  cardAccent: { backgroundColor: colors.primarySoft, borderWidth: 1, borderColor: '#dcd9ff' },
   cardTitle: { fontSize: 12.5, fontWeight: '700', color: colors.text2, letterSpacing: 0.2, marginBottom: 10 },
+  tag: { fontSize: 9.5, fontWeight: '700', color: colors.primaryDeep },
+  rowVal: { fontSize: 12.5, fontWeight: '600', color: colors.text2 },
+  // 「服务与后端」折叠头
+  foldHd: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  foldT: { fontSize: 12.5, fontWeight: '700', color: colors.text2, letterSpacing: 0.2 },
+  foldRight: { flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 1, minWidth: 0 },
+  foldN: { fontFamily: mono, fontSize: 10, color: colors.faint, flexShrink: 1 },
+  foldChev: { fontSize: 13, color: colors.faint },
   seg: { flexDirection: 'row', backgroundColor: colors.background, borderRadius: radius.md, padding: 3, gap: 3 },
   segItem: { flex: 1, paddingVertical: 8, borderRadius: radius.md - 3, alignItems: 'center' },
   segItemOn: { backgroundColor: colors.primary },

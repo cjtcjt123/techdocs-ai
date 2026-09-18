@@ -22,6 +22,12 @@ let __cases = [];
 export function __setCases(list) { __cases = list; }
 export function __getCases() { return __cases; }
 export async function getAllChunksForIndex() { return __chunks; }
+// 口径同 retrieval.ts 的 charsFingerprint（Σ(长度 + 1)）
+export async function getChunksFingerprint() {
+  let chars = 0;
+  for (const c of __chunks) chars += (c.content || '').length + 1;
+  return { count: __chunks.length, chars };
+}
 export async function getDocuments() { return __docs; }
 export async function getEmbeddings(docIds) {
   if (docIds && docIds.length === 0) return [];

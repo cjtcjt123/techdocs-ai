@@ -254,7 +254,7 @@ async function main() {
   await shot('01-初始');
 
   const askQuestion = async (q, n) => {
-    await clickText('问答');
+    await clickText('助手');
     await sleep(1200);
     await typeInto('输入问题', q);
     await sleep(400);
@@ -396,7 +396,7 @@ async function main() {
   // 不用数「来源 · N」等回答数 —— reload 后会话历史是否恢复不该影响这段的成败。
   const askAndGrab = async () => {
     try { fs.unlinkSync(PROMPT_FILE); } catch { /* 本来就不存在 */ }
-    await clickText('问答');
+    await clickText('助手');
     await sleep(1500);
     await typeInto('输入问题', Q);
     await sleep(400);

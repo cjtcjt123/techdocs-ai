@@ -14,7 +14,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   await send('Page.navigate', { url: URL_ });
   await sleep(15000);
   // click 问答 tab
-  const click = "(()=>{var c=Array.from(document.querySelectorAll('[role=button],button,a,[tabindex]'));var el=c.find(function(e){return (e.innerText||'').indexOf('问答')>=0});if(!el)return 'NF';var r=el.getBoundingClientRect();var o={bubbles:true,cancelable:true,view:window,clientX:r.left+r.width/2,clientY:r.top+r.height/2};['pointerdown','pointerup','click'].forEach(function(t){el.dispatchEvent(new MouseEvent(t,o))});return 'OK'})()";
+  const click = "(()=>{var c=Array.from(document.querySelectorAll('[role=button],button,a,[tabindex]'));var el=c.find(function(e){return (e.innerText||'').indexOf('助手')>=0});if(!el)return 'NF';var r=el.getBoundingClientRect();var o={bubbles:true,cancelable:true,view:window,clientX:r.left+r.width/2,clientY:r.top+r.height/2};['pointerdown','pointerup','click'].forEach(function(t){el.dispatchEvent(new MouseEvent(t,o))});return 'OK'})()";
   const cres = await send('Runtime.evaluate', { expression: click, returnByValue: true });
   console.log('click 问答:', cres.result && cres.result.value);
   await sleep(8000);

@@ -12,10 +12,23 @@
  */
 import { KeywordIndex, tokenize } from './keyword';
 import type { KeywordHit } from './keyword';
-import { getAllChunksForIndex, getDocuments, getEmbeddings, listVerifiedCases } from './storage';
+import {
+  getAllChunksForIndex,
+  getChunksFingerprint,
+  getDocuments,
+  getEmbeddings,
+  listVerifiedCases,
+} from './storage';
 import { cosine, embedTexts } from './embedding';
 import type { EmbeddingConfig } from './settings';
-import { caseCorpusRow, caseDisplayName, caseDocId, isCaseDocId, indexableCases } from './cases';
+import {
+  caseCorpusRow,
+  caseDisplayName,
+  caseDocId,
+  caseToText,
+  isCaseDocId,
+  indexableCases,
+} from './cases';
 import type { CaseRecord } from '../types';
 import type { SearchResult } from '../types';
 
@@ -35,10 +48,24 @@ let cachedVectors: Array<{ chunkId: string; docId: string; vec: Float32Array }> 
 // 它每次问答只被读两次（建索引 + 回填名字），量级是几十行的小表，代价可忽略。
 let cachedCases: CaseRecord[] = [];
 
-function fingerprintOf(rows: CorpusRow[]): string {
+/**
+ * 指纹的字符口径：Σ(长度 + 1)。
+ *
+ * 那个 +1 不是笔误 —— 没有它的话「1 块 10 字」和「2 块 9 字」会撞成同一个指纹，
+ * 于是改一个字但总字数不变的操作（比如把两行合并成一行）不会触发重建。
+ *
+ * 抽成一个函数是因为现在有【三个地方】要按这个口径算数：
+ * fingerprintOf（真实行）、corpusFingerprint（便宜版）、以及 SQLite 里那条 SQL。
+ * 前两个共用它就保证了口径一致；第三个靠注释对齐（见 storage.getChunksFingerprint）。
+ */
+function charsFingerprint(parts: Array<string | undefined>): number {
   let total = 0;
-  for (const r of rows) total += (r.content || '').length + 1;
-  return `${rows.length}:${total}`;
+  for (const p of parts) total += (p || '').length + 1;
+  return total;
+}
+
+function fingerprintOf(rows: CorpusRow[]): string {
+  return `${rows.length}:${charsFingerprint(rows.map((r) => r.content))}`;
 }
 
 /** 取语料行（关键词索引与语义路共用同一份缓存） */
@@ -74,20 +101,43 @@ async function loadCaseCorpus(): Promise<CaseRecord[]> {
 }
 
 /**
+ * 语料指纹（便宜版）—— 只回一个字符串，不把正文拉回内存。
+ *
+ * 为什么值得单开一个函数：缓存失效判定只需要「块数:总字数」这两个数字，
+ * 而以前为了得到它们，得先把全部 chunk 正文（几 MB）JOIN 出来传一遍再在 JS 里累加 ——
+ * 每次提问都付这笔钱，纯粹是为了决定「要不要重建」。
+ * 文档部分交给 SQLite 聚合（见 storage.getChunksFingerprint），案例部分本来就在内存里。
+ *
+ * 口径必须与 fingerprintOf() 完全一致：Σ(长度 + 1)。
+ */
+async function corpusFingerprint(): Promise<string> {
+  const d = await getChunksFingerprint();
+  const cases = await loadCaseCorpus();
+  // caseToText 的第二个参数刻意不传：caseCorpusRow 建行时也是这么调的，口径要一致
+  const caseChars = charsFingerprint(cases.map((c) => caseToText(c)));
+  return `${d.count + cases.length}:${d.chars + caseChars}`;
+}
+
+/**
  * 取（必要时重建）关键词索引。语料指纹变了就重建。
  *
  * 经验库案例以 `case:<id>` 的虚拟 docId 拼进同一份语料 —— 于是：
  *   · 案例走的是同一套 BM25 与同一套缓存，零新增检索代码
  *   · 案例计入指纹（块数:总字数）→ 记一条新案例会自动触发重建，不需要任何额外的失效调用
+ *
+ * 命中缓存的路径只读两个数字，不碰正文；只有真要重建时才拉全量。
  */
 export async function getKeywordIndex(): Promise<KeywordIndex> {
+  if (cachedIndex && cachedFingerprint === (await corpusFingerprint())) return cachedIndex;
+
   const docRows = (await getAllChunksForIndex()) as CorpusRow[];
   const cases = await loadCaseCorpus();
   const rows: CorpusRow[] = [...docRows, ...cases.map(caseCorpusRow)];
-  const fp = fingerprintOf(rows);
-  if (cachedIndex && cachedFingerprint === fp) return cachedIndex;
   cachedRows = rows;
-  cachedFingerprint = fp;
+  // 落库用【真实行】算出的指纹，而不是上面那个轻量指纹：
+  // 轻量指纹与下面这次查询之间语料可能又变了（导入刚完成就是这种时刻），
+  // 用轻量值当缓存键的话，缓存会记着一个不属于当前行的值，之后就再也不会失效。
+  cachedFingerprint = fingerprintOf(rows);
   cachedIndex = new KeywordIndex(
     rows.map((r) => ({
       id: r.id,

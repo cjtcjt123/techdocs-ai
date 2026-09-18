@@ -161,11 +161,20 @@ async function main() {
   const bodyText = () => evaluate('document.body ? document.body.innerText : ""');
 
   // RN web 的 Pressable 监听 pointer 事件，只发 click 不一定触发
+  // 点击文字。
+  // ⚠️ 匹配顺序是「精确相等 → 包含」，不能只写 includes：
+  //    模式条上有个「贴要求核对」，而发送按钮就叫「核对」—— 用包含匹配会点到模式条上，
+  //    脚本还报 CLICKED，接下来等一个永远不会出现的核对结果，排查半天。
+  //    另外先 scrollIntoView：元素在视口之外时 getBoundingClientRect 给的坐标不在屏幕上，
+  //    派发出去的事件就落空了（而返回值照样是 CLICKED）。
   const clickText = (text, sel = '[role="button"], [role="tab"], button, a, [tabindex]') =>
     evaluate(`(() => {
       const cands = Array.from(document.querySelectorAll(${JSON.stringify(sel)}));
-      const el = cands.find(e => (e.innerText || '').includes(${JSON.stringify(text)}));
+      const T = ${JSON.stringify(text)};
+      const vis = cands.filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+      const el = vis.find(e => (e.innerText || '').trim() === T) || vis.find(e => (e.innerText || '').includes(T));
       if (!el) return 'NOT_FOUND';
+      el.scrollIntoView({ block: 'center' });
       const r = el.getBoundingClientRect();
       const opts = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width/2, clientY: r.top + r.height/2 };
       ['pointerdown','pointerup','click'].forEach(t => el.dispatchEvent(new MouseEvent(t, opts)));
@@ -231,11 +240,14 @@ async function main() {
   }
 
   // RN web 的 Pressable 监听 pointer 事件，只发 click 不一定触发
-  // 默认 Tab 是「工作台」，导入入口在「最近资料」右侧
-  console.log('\n=== 点击「＋ 导入」 ===');
-  const clicked = await clickText('导入');
+  // 底栏现在是「助手 / 资料库 / 我的」（2026-09-18 起），导入入口在资料库页底部 ——
+  // 原来那个独立的「工作台」Tab 已经不存在了（它的状态卡并进了助手页空态）
+  console.log('\n=== 切到「资料库」→ 点击「导入文档」 ===');
+  await clickText('资料库');
+  await sleep(2000);
+  const clicked = await clickText('导入文档');
   console.log(clicked);
-  if (clicked !== 'CLICKED') throw new Error('找不到「＋ 导入」按钮');
+  if (clicked !== 'CLICKED') throw new Error('找不到「＋ 导入文档」按钮');
 
   // picker 会往 body 里塞一个 display:none 的 input[type=file] 并 click()。
   // headless 下系统选择框不会出现，等它出现在 DOM 里后用 CDP 直接塞文件。
@@ -290,16 +302,17 @@ async function main() {
   // 验的是「换句话也能搜到」这件事在真浏览器里成立：问题用「有效期」，
   // 原文写的是「保质期」，零字面重叠 —— 只有向量那一路能捞到。
   if (EMBED && ASK) {
-    // 「我的」不再是 Tab（4 个 Tab 才不挤），入口在工作台顶栏的「设置」胶囊
-    console.log('\n=== 回工作台 → 设置 · 重建语义索引 ===');
-    await clickText('工作台');
-    await sleep(1500);
-    await clickText('设置');
+    // 「我的」现在是底栏第三格，直接点就行（以前要先回工作台、再点顶栏的齿轮）
+    console.log('\n=== 底栏「我的」· 重建语义索引 ===');
+    await clickText('我的');
     await sleep(2500);
+    // 语义检索现在收在「服务与后端」折叠组里（默认收起 —— 这三个地址配一次就不再动了）
+    console.log('展开折叠组:', await clickText('服务与后端'));
+    await sleep(1200);
     const profile = await bodyText();
     if (!/重建语义索引/.test(profile)) {
       console.log(profile.slice(0, 800));
-      throw new Error('「我的」页没找到「重建语义索引」按钮');
+      throw new Error('「我的 → 服务与后端」展开后没找到「重建语义索引」按钮');
     }
     const embClick = await clickText('重建语义索引');
     console.log(embClick);
@@ -313,8 +326,8 @@ async function main() {
       !!em && Number(em[1]) > 0 && em[1] === em[2],
     ]);
 
-    console.log(`\n=== 切到「问答」· 提问「${ASK}」 ===`);
-    await clickText('问答');
+    console.log(`\n=== 切回「助手」· 提问「${ASK}」 ===`);
+    await clickText('助手');
     await sleep(2500);
     console.log(await typeInto('输入问题', ASK));
     await sleep(500);
@@ -339,18 +352,20 @@ async function main() {
     results.push([`问答屏没有文字被裁切（扫到 ${chatClip.length} 处疑似）`, chatClip.length === 0]);
     chatClip.forEach((b) => console.log(`   ⚠️ ${describe(b)}`));
 
-    // ---------- 对比页（需求符合性检查）----------
-    console.log('\n=== 切到「对比」· 跑一次逐项判定 ===');
-    await clickText('对比');
-    await sleep(2500);
+    // ---------- 核对模式（原「对比」页）----------
+    // C 方案之后它降级成输入栏上方的模式开关：切模式 → 贴要求 → 点「核对」。
+    // 结果作为一条会话消息回来（不再有独立结果区），所以刷新、切会话都不会丢。
+    console.log('\n=== 切到「贴要求核对」· 跑一次逐项判定 ===');
+    console.log('切模式:', await clickText('贴要求核对'));
+    await sleep(1200);
     console.log(await typeInto('贴上技术要求', '弯曲强度 ≥ 110 MPa\n拉伸强度 ≥ 75 MPa\n热变形温度 ≥ 130 °C'));
     await sleep(600);
-    console.log('开始比对:', await clickText('开始比对'));
-    const cmpText = await waitFor(/\d+\s*满足\s*·\s*\d+\s*差一点/, 90000, '对比结果');
-    console.log('--- 对比界面 ---');
+    console.log('开始核对:', await clickText('核对'));
+    const cmpText = await waitFor(/已对要求逐项比对|满足/, 90000, '核对结果');
+    console.log('--- 核对界面 ---');
     console.log(cmpText.slice(0, 900));
-    results.push(['对比页输出了逐项判定', /差一点/.test(cmpText) && /满足/.test(cmpText)]);
-    results.push(['对比页底部有汇总条', /\d+\s*满足\s*·\s*\d+\s*差一点/.test(cmpText)]);
+    results.push(['核对模式输出了逐项判定', /满足/.test(cmpText)]);
+    results.push(['判定结果落进了会话消息（而不是独立结果区）', /已对要求逐项比对/.test(cmpText)]);
 
     // 对比屏的判定表是等宽三列 + 右侧 pill，列宽最容易把长中文压出裁切
     const cmpClip = await evaluate(SCAN_EXPR);

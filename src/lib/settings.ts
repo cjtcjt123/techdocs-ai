@@ -8,7 +8,17 @@ const NAS_PW_STORE = 'nas_password';
 const SETTINGS_KEY = 'app_settings';
 
 export interface PrivacySettings {
-  faceID: boolean;
+  /**
+   * 启动时锁定 App。
+   *
+   * ⚠️ 这个字段**以前叫 `faceID`**，但它的语义从来只是「启动时锁一下」——
+   * 名字却暗示它管面容，于是界面上写「隐私锁（Face ID / 密码）」、实际只有 4 位密码，
+   * 一挂就是很久（用户凭手感发现「好像只有密码」）。改名的目的就是断掉这个误会。
+   * 旧值由 loadSettings() 从 `faceID` 迁移过来。
+   */
+  lock: boolean;
+  /** 允许用面容 / 指纹解锁。默认开 —— 有硬件且已录入时不必再让人点一次开关 */
+  biometric: boolean;
   offlineMode: boolean;
   cloudConfirm: boolean;
 }
@@ -53,7 +63,7 @@ export function defaultSettings(): AppSettings {
   return {
     modelConfig: { source: 'api', provider: 'openai', baseURL: '', apiKey: '', model: 'gpt-4o-mini' },
     dataStrategy: 'local',
-    privacy: { faceID: false, offlineMode: false, cloudConfirm: false },
+    privacy: { lock: false, biometric: true, offlineMode: false, cloudConfirm: false },
     exportFormat: 'markdown',
     retrieval: { topK: 8, onlyPinned: false, tags: [] },
     localMirror: true,
@@ -81,7 +91,14 @@ export async function loadSettings(): Promise<AppSettings> {
       exportFormat,
       modelConfig: { ...defaultSettings().modelConfig, ...mc, source: normalizedSource, apiKey },
       nas: parsed.nas ? { ...parsed.nas, user: parsed.nas.user || '' } : undefined,
-      privacy: { ...defaultSettings().privacy, ...(parsed.privacy || {}) },
+      // 隐私设置：旧版本这个字段叫 faceID（语义就是「启动时锁定」）→ 迁移到 lock。
+      // 不迁移的话，老用户升级后锁会静悄悄关掉（存的是 faceID，读的是 lock）。
+      // 顺序要紧：先铺开存量值，再用 lock 显式覆盖，这样两种字段名都读得到。
+      privacy: {
+        ...defaultSettings().privacy,
+        ...(parsed.privacy || {}),
+        lock: !!(parsed.privacy?.lock ?? parsed.privacy?.faceID),
+      },
       // 旧版本无 retrieval 字段，补齐默认值；tags 保证是数组（旧数据可能是 null/undefined）
       retrieval: {
         ...defaultSettings().retrieval,

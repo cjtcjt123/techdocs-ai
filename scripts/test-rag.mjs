@@ -15,6 +15,13 @@ export const __docs = [];
 export const __chunks = [];
 export const __embs = [];
 export async function getAllChunksForIndex() { return __chunks; }
+// 口径必须和 retrieval.ts 里 charsFingerprint 一致（Σ(长度 + 1)），
+// 否则这条测试会因为「指纹永远对不上」而每次都重建索引 —— 结果仍然对，但测不到缓存路径。
+export async function getChunksFingerprint() {
+  let chars = 0;
+  for (const c of __chunks) chars += (c.content || '').length + 1;
+  return { count: __chunks.length, chars };
+}
 export async function getDocuments() { return __docs; }
 export async function getEmbeddings(docIds) {
   if (docIds && docIds.length === 0) return [];

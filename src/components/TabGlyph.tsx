@@ -3,7 +3,7 @@
 import React from 'react';
 import { View } from 'react-native';
 
-export type GlyphName = 'work' | 'lib' | 'chat' | 'cmp' | 'gear';
+export type GlyphName = 'work' | 'lib' | 'chat' | 'cmp' | 'gear' | 'me';
 
 // [x, y, w, h, r]
 const SHAPES: Record<GlyphName, Array<[number, number, number, number, number]>> = {
@@ -26,8 +26,10 @@ const SHAPES: Record<GlyphName, Array<[number, number, number, number, number]>>
     [2, 2, 4.6, 12, 1.8],
     [9.4, 2, 4.6, 7, 1.8],
   ],
-  // 设置：环 + 中心点（不出现在 Tab 栏，走特殊分支画）
+  // 环 + 中心点：这两个不在这里画，走下面的特殊分支。
+  // gear = 设置入口；me = 底栏的「我的」—— 同一个形状，它要表达的就是「设置都在这」。
   gear: [],
+  me: [],
 };
 
 export default function TabGlyph({ name, color, size = 22 }: { name: GlyphName; color: string; size?: number }) {
@@ -48,8 +50,8 @@ export default function TabGlyph({ name, color, size = 22 }: { name: GlyphName; 
           }}
         />
       ))}
-      {/* 设置：环 + 中心点 */}
-      {name === 'gear' ? (
+      {/* 设置 / 我的：环 + 中心点 */}
+      {name === 'gear' || name === 'me' ? (
         <>
           <View
             style={{

@@ -162,6 +162,25 @@ export async function getAllChunksForIndex(): Promise<
   );
 }
 
+/**
+ * 语料指纹（文档部分）—— 只回两个数字，不把正文拉回内存。
+ *
+ * 存在的理由：检索缓存靠「块数:总字数」判定失效，而以前为了算这两个数字，
+ * 得把全部 chunk 正文（几 MB）JOIN 出来传一遍再在 JS 里累加 —— 每次提问都付这笔钱。
+ * 聚合本来就是 SQLite 的活。
+ *
+ * chars 的口径必须和 retrieval.ts 里 fingerprintOf() 一致：Σ(长度 + 1)。
+ * 那个 +1 不是笔误，是让「1 块 10 字」与「2 块 9 字」不会撞成同一个指纹。
+ */
+export async function getChunksFingerprint(): Promise<{ count: number; chars: number }> {
+  const r = await db.getFirstAsync<any>(
+    `SELECT COUNT(*) AS count,
+            COALESCE(SUM(LENGTH(COALESCE(c.content, '')) + 1), 0) AS chars
+     FROM chunks c JOIN documents d ON d.id = c.docId`
+  );
+  return { count: Number(r?.count ?? 0), chars: Number(r?.chars ?? 0) };
+}
+
 // 取指定文档的文本块 —— 「钉住文档」每次问答自动带入时用
 export async function getChunksByDocs(docIds: string[], limit = 12): Promise<any[]> {
   if (!docIds.length) return [];

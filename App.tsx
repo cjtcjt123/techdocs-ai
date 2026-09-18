@@ -5,10 +5,8 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
-import WorkbenchScreen from './src/screens/WorkbenchScreen';
 import LibraryScreen from './src/screens/LibraryScreen';
 import ChatScreen from './src/screens/ChatScreen';
-import CompareScreen from './src/screens/CompareScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
 import DocDetailScreen from './src/screens/DocDetailScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
@@ -69,33 +67,36 @@ function Tabs() {
       }}
     >
       {/* tabBarAccessibilityLabel 要显式给：文字改成自绘后，读屏就不再自动拿到标签名了 */}
+      {/* 顺序按使用频率排：提问最多，资料库次之，设置最少。
+          「助手」= 问答页 + 底部的模式开关（问一句 / 贴要求核对）—— 原来独立的「对比」Tab
+          并进了那个开关：两条路本来就是同一段提示词、同一个 system prompt，只是结果去向不同，
+          摆成两个入口只会让人不知道该点哪个。 */}
       <Tab.Screen
-        name="Workbench"
-        component={WorkbenchScreen}
-        options={{ title: '工作台', headerShown: false, tabBarAccessibilityLabel: '工作台', tabBarIcon: tabIcon('work', '工作台') }}
+        name="Chat"
+        component={ChatScreen}
+        options={{ title: '助手', headerShown: false, tabBarAccessibilityLabel: '助手', tabBarIcon: tabIcon('chat', '助手') }}
       />
-      {/* 资料库/问答屏自绘了标题栏，再留系统 header 会出现两个「资料库」 */}
+      {/* 三屏都自绘了标题栏，再留系统 header 会出现两个同名标题 */}
       <Tab.Screen
         name="Library"
         component={LibraryScreen}
         options={{ title: '资料库', headerShown: false, tabBarAccessibilityLabel: '资料库', tabBarIcon: tabIcon('lib', '资料库') }}
       />
       <Tab.Screen
-        name="Chat"
-        component={ChatScreen}
-        options={{ title: '问答', headerShown: false, tabBarAccessibilityLabel: '问答', tabBarIcon: tabIcon('chat', '问答') }}
-      />
-      <Tab.Screen
-        name="Compare"
-        component={CompareScreen}
-        options={{ title: '对比', headerShown: false, tabBarAccessibilityLabel: '对比', tabBarIcon: tabIcon('cmp', '对比') }}
+        name="Profile"
+        component={ProfileScreen}
+        options={{ title: '我的', headerShown: false, tabBarAccessibilityLabel: '我的', tabBarIcon: tabIcon('me', '我的') }}
       />
     </Tab.Navigator>
   );
 }
 
 export default function App() {
-  const { ready, init, locked, settings } = useStore();
+  // 逐字段订阅，别用 useStore() 整包订阅：那会让任何一次 state 变化（thinking、lastError、
+  // documents…）都重渲染整个导航器与它下面所有屏。这里只需要三个字段，其中两个是标量。
+  const ready = useStore((s) => s.ready);
+  const locked = useStore((s) => s.locked);
+  const init = useStore((s) => s.init);
 
   useEffect(() => { init(); }, []);
 
@@ -107,8 +108,14 @@ export default function App() {
     );
   }
 
-  // 隐私锁：开启了 Face ID 密码且当前锁定 → 显示锁屏
-  if (settings.privacy.faceID && locked) {
+  // 隐私锁：locked 是唯一门控。它有两个来源，语义不同，别再合并成一个条件：
+  //   · 启动时 —— init 里按「设了密码 && 开着『启动时锁定』」决定（开关关着就不锁）
+  //   · 运行中 —— 「我的 → 立即锁定」无条件置 true，用户明确点了就得锁，不看开关
+  // 以前写的是 `privacy.lock && locked`：开关关着时「立即锁定」点了没反应，
+  // 而且 locked 会残留 true —— 等哪天保存设置把开关打开，屏幕会莫名自己锁上。
+  // ⚠️ 这个开关以前叫 privacy.faceID，名字暗示它管面容，实际只是「锁一下」——
+  // 改名为 lock 就是为了不再让人（和我）误会（详见 lib/settings.ts 的注释）。
+  if (locked) {
     return (
       <SafeAreaProvider>
         <LockScreen />
@@ -123,9 +130,8 @@ export default function App() {
         <NavigationContainer>
           <Stack.Navigator id="root">
             <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
-            {/* 「我的」放在 Stack 里（不是 Tab）：4 个 Tab 才不挤，而且 push 进来自带返回箭头。
-                入口在工作台顶栏的「设置」胶囊；旧的 navigate('Profile') 依旧有效（会冒泡到父 Stack）。 */}
-            <Stack.Screen name="Profile" component={ProfileScreen} options={{ title: '我的' }} />
+            {/* 「我的」已经升成底栏第三格（见上面的 Tabs），这里不再有它的 Stack 入口。
+                设置类内容全在那一个 Tab 里，不用再先进工作台找齿轮。 */}
             <Stack.Screen name="DocDetail" component={DocDetailScreen} options={{ title: '文档详情' }} />
             <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: '更多设置' }} />
             {/* 本地模型管理：从「我的 → 手机本地模型」进。单独一屏而不是塞进设置里 ——

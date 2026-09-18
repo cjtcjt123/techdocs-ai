@@ -199,7 +199,7 @@ async function main() {
   await sleep(WAIT_BOOT);
   console.log('  （已加载）');
 
-  await shot('00-工作台');
+  await shot('00-助手');
   console.log('  切资料库：', await click('资料库'));
   await sleep(900);
   await shot('01-资料库');
@@ -250,10 +250,11 @@ async function main() {
   };
 
   // 收尾：不要留着半开的表单 —— 这个浏览器窗口可能被人直接接管去看。
-  // 重新加载后停在经验库列表（而不是默认的工作台），打开就能看到东西。
+  // 重新加载后停在经验库列表（而不是默认的「助手」），打开就能看到东西。
   console.log('\n  收尾：把页面停在经验库列表');
   await send('Page.navigate', { url: URL_ });
-  const booted = await waitForText('工作台', WAIT_BOOT * 2);
+  // 底栏与页面标题都叫「助手」，这里只要判断界面起来了，用哪个都行
+  const booted = await waitForText('助手', WAIT_BOOT * 2);
   console.log(`  界面已就绪：${booted ? '✅' : '❌ 超时'}`);
   console.log('  切资料库：', await click('资料库'));
   await sleep(900);
