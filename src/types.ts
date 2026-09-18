@@ -9,6 +9,12 @@ export interface DocMeta {
   model?: string; // 产品型号（如 CY1578）
   date?: string;
   size?: number;
+  // ↓ 解析结果（导入时一次写入，用于资料库/详情页展示与排障）
+  parseSource?: 'nas' | 'local' | 'none'; // 文本从哪来
+  parseQuality?: number; // 0~1，越高越可信
+  pages?: number; // PDF 页数
+  chars?: number; // 提取到的字符数（0 = 没提到内容）
+  note?: string; // 未提取到 / 质量偏低的原因
 }
 
 export interface Document {
@@ -17,9 +23,27 @@ export interface Document {
   type: DocType;
   folderId?: string | null;
   tags: string[];
+  pinned?: boolean; // 钉住：每次问答自动带入
   status: DocStatus;
   meta: DocMeta;
   createdAt: string;
+}
+
+// 检索范围与条数（问答时使用，可在问答页快速调整）
+export interface RetrievalConfig {
+  topK: number; // 带几段上下文
+  onlyPinned: boolean; // 只用钉住的文档
+  tags: string[]; // 限定标签（空 = 全部资料）
+}
+
+// 全局搜索结果（资料库搜索页：文档名命中 + 原文片段命中）
+export interface SearchResult {
+  kind: 'doc' | 'chunk';
+  docId: string;
+  docName: string;
+  pageNo?: number;
+  snippet: string;
+  score: number;
 }
 
 export interface Chunk {
@@ -36,9 +60,12 @@ export interface Quote {
   docName: string;
   pageNo?: number;
   snippet: string;
+  score?: number; // 融合后的归一得分（0~1）
+  from?: string[]; // 命中该条的路：keyword / semantic / pinned
+  pinned?: boolean; // 来自「钉住文档」，不是检索命中的
 }
 
-export type ModelSource = 'official' | 'local' | 'nas';
+export type ModelSource = 'api' | 'local';
 export type Provider = 'openai' | 'claude' | 'deepseek' | 'tongyi' | 'zhipu' | 'custom';
 
 export interface ModelConfig {
@@ -50,6 +77,17 @@ export interface ModelConfig {
 }
 
 export type DataStrategy = 'local' | 'local+sync' | 'nas-only';
+
+// NAS 连接配置（密码单独存 secure 层，不在此结构里）
+export interface NasConnection {
+  protocol: 'webdav' | 'smb';
+  host: string;
+  port: string; // 如 '5005'
+  path: string; // 基路径，如 '/' 或 '/webdav'
+  secure: boolean; // 是否 https
+  user: string;
+}
+
 
 export interface Attachment {
   name: string;

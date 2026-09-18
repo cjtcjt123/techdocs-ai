@@ -8,6 +8,8 @@ interface DBShape {
   documents: Document[];
   chunks: Chunk[];
   kv: Record<string, string>;
+  // 语义检索向量，vec 是 base64 后的 float32（比 JSON 数组省 60% 体积，localStorage 只有 5MB）
+  embeddings: Array<{ chunkId: string; docId: string; model?: string; dim?: number; vec: string }>;
 }
 
 let cache: DBShape | null = null;
@@ -25,6 +27,7 @@ function load(): DBShape {
     documents: Array.isArray(parsed?.documents) ? parsed.documents : [],
     chunks: Array.isArray(parsed?.chunks) ? parsed.chunks : [],
     kv: parsed?.kv && typeof parsed.kv === 'object' ? parsed.kv : {},
+    embeddings: Array.isArray(parsed?.embeddings) ? parsed.embeddings : [],
   };
   return cache;
 }
@@ -80,12 +83,27 @@ export async function deleteDocument(id: string) {
   const db = load();
   db.documents = db.documents.filter(d => d.id !== id);
   db.chunks = db.chunks.filter(c => c.docId !== id);
+  db.embeddings = db.embeddings.filter(e => e.docId !== id); // 向量随文档一起清，别留孤儿
   persist();
 }
 
 export async function renameDocument(id: string, name: string) {
   const doc = load().documents.find(d => d.id === id);
   if (doc) doc.name = name;
+  persist();
+}
+
+// 钉住 / 取消钉住（web 版文档就是普通对象，pinned 直接读写；旧数据无此字段视为 false）
+export async function setDocumentPinned(id: string, pinned: boolean) {
+  const doc = load().documents.find(d => d.id === id);
+  if (doc) doc.pinned = pinned;
+  persist();
+}
+
+// 覆盖式设置标签
+export async function setDocumentTags(id: string, tags: string[]) {
+  const doc = load().documents.find(d => d.id === id);
+  if (doc) doc.tags = tags;
   persist();
 }
 
@@ -104,28 +122,102 @@ export async function getChunks(docId: string): Promise<Chunk[]> {
   return load().chunks.filter(c => c.docId === docId).sort((a, b) => a.seq - b.seq);
 }
 
-// ---- 全文检索（MVP 用关键词，向量检索后置；打分逻辑与原生版一致）----
-export async function searchChunks(query: string, limit = 8): Promise<any[]> {
+// ---- 检索数据源 ----
+// 检索层（retrieval.ts）需要全量 chunk 建内存索引（BM25 依赖全量 df / 平均长度统计）
+export async function getAllChunksForIndex(): Promise<
+  Array<{ id: string; docId: string; content: string; pageNo?: number }>
+> {
+  return load().chunks.map(c => ({
+    id: c.id, docId: c.docId, content: c.content, pageNo: c.pageNo,
+  }));
+}
+
+// 取指定文档的文本块 —— 「钉住文档」自动带入上下文时用
+export async function getChunksByDocs(docIds: string[], limit = 12): Promise<any[]> {
+  if (!docIds.length) return [];
   const db = load();
-  const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 1);
-  if (terms.length === 0) return [];
+  const allow = new Set(docIds);
   const nameById = new Map(db.documents.map(d => [d.id, d.name]));
-  const scored = db.chunks
-    .filter(c => nameById.has(c.docId))
-    .map(c => {
-      const text = (c.content || '').toLowerCase();
-      let score = 0;
-      for (const t of terms) if (text.includes(t)) score++;
-      return {
-        docId: c.docId,
-        content: c.content,
-        pageNo: c.pageNo,
-        docName: nameById.get(c.docId) as string,
-        score,
-      };
-    })
-    .filter(r => r.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-  return scored;
+  return db.chunks
+    .filter(c => allow.has(c.docId) && nameById.has(c.docId))
+    .sort((a, b) => (a.docId === b.docId ? a.seq - b.seq : a.docId < b.docId ? -1 : 1))
+    .slice(0, limit)
+    .map(c => ({
+      docId: c.docId, content: c.content, pageNo: c.pageNo,
+      docName: nameById.get(c.docId) as string,
+    }));
+}
+
+// ---- 语义检索向量（派生数据：丢了按原文本重算即可）----
+// 用 base64(float32) 而不是 JSON 数组：localStorage 只有 5MB，JSON 里每条 float 要 8~10 个字符。
+// （真机走 storage.ts 的 sqlite BLOB，没这个限制；这里只是让浏览器预览也能自测）
+
+function f32ToB64(v: Float32Array): string {
+  const bytes = new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength));
+  let s = '';
+  const CH = 8192; // 分块喂给 fromCharCode，避免参数过多爆栈
+  for (let i = 0; i < bytes.length; i += CH) {
+    s += String.fromCharCode(...(Array.from(bytes.subarray(i, i + CH)) as number[]));
+  }
+  return btoa(s);
+}
+
+function b64ToF32(b64: string): Float32Array {
+  try {
+    const bin = atob(b64 || '');
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    if (bytes.byteLength % 4 !== 0) return new Float32Array(0);
+    return new Float32Array(bytes.buffer);
+  } catch {
+    return new Float32Array(0);
+  }
+}
+
+export interface EmbeddingRow {
+  chunkId: string;
+  docId: string;
+  vec: Float32Array;
+}
+
+export async function putEmbeddings(
+  rows: Array<{ chunkId: string; docId: string }>,
+  vectors: number[][],
+  model: string
+): Promise<void> {
+  const db = load();
+  for (let i = 0; i < rows.length; i++) {
+    const vec = new Float32Array(vectors[i] || []);
+    const next = { chunkId: rows[i].chunkId, docId: rows[i].docId, model, dim: vec.length, vec: f32ToB64(vec) };
+    const at = db.embeddings.findIndex(e => e.chunkId === rows[i].chunkId);
+    if (at >= 0) db.embeddings[at] = next;
+    else db.embeddings.push(next);
+  }
+  persist();
+}
+
+export async function getEmbeddings(docIds?: string[]): Promise<EmbeddingRow[]> {
+  if (docIds && docIds.length === 0) return [];
+  const allow = docIds && docIds.length ? new Set(docIds) : null;
+  return load().embeddings
+    .filter(e => !allow || allow.has(e.docId))
+    .map(e => ({ chunkId: e.chunkId, docId: e.docId, vec: b64ToF32(e.vec) }));
+}
+
+export async function embeddingStats(): Promise<{ count: number; model: string | null; dim: number | null }> {
+  const list = load().embeddings;
+  const first = list[0];
+  return { count: list.length, model: first?.model ?? null, dim: first?.dim ?? null };
+}
+
+export async function deleteEmbeddingsByDoc(docId: string): Promise<void> {
+  const db = load();
+  db.embeddings = db.embeddings.filter(e => e.docId !== docId);
+  persist();
+}
+
+export async function clearEmbeddings(): Promise<void> {
+  const db = load();
+  db.embeddings = [];
+  persist();
 }

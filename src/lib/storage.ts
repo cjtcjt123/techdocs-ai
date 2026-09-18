@@ -13,6 +13,7 @@ export async function initDB() {
       type TEXT NOT NULL,
       folderId TEXT,
       tags TEXT,
+      pinned INTEGER DEFAULT 0,
       status TEXT NOT NULL,
       meta TEXT,
       createdAt TEXT NOT NULL
@@ -30,7 +31,23 @@ export async function initDB() {
       k TEXT PRIMARY KEY,
       v TEXT
     );
+    CREATE TABLE IF NOT EXISTS embeddings (
+      chunkId TEXT PRIMARY KEY,
+      docId TEXT NOT NULL,
+      model TEXT,
+      dim INTEGER,
+      vec BLOB
+    );
+    CREATE INDEX IF NOT EXISTS idx_emb_doc ON embeddings(docId);
   `);
+  // 老库升级：已装机用户的 documents 表没有 pinned 列，
+  // CREATE TABLE IF NOT EXISTS 不会补列，必须显式 ALTER，否则读取时报 no such column 直接崩。
+  // 列已存在时会抛错，吞掉即可（幂等）。
+  try {
+    await db.execAsync(`ALTER TABLE documents ADD COLUMN pinned INTEGER DEFAULT 0`);
+  } catch {
+    // 列已存在，无需处理
+  }
 }
 
 // ---- 设置持久化（非敏感字段存 kv，apiKey 走 secure-store）----
@@ -46,10 +63,10 @@ export async function kvSet(k: string, v: string): Promise<void> {
 // ---- 文档 ----
 export async function insertDocument(doc: Document) {
   await db.runAsync(
-    `INSERT OR REPLACE INTO documents (id,name,type,folderId,tags,status,meta,createdAt)
-     VALUES (?,?,?,?,?,?,?,?)`,
+    `INSERT OR REPLACE INTO documents (id,name,type,folderId,tags,pinned,status,meta,createdAt)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
     [doc.id, doc.name, doc.type, doc.folderId ?? null, JSON.stringify(doc.tags),
-     doc.status, JSON.stringify(doc.meta), doc.createdAt]
+     doc.pinned ? 1 : 0, doc.status, JSON.stringify(doc.meta), doc.createdAt]
   );
 }
 
@@ -61,7 +78,7 @@ export async function getDocuments(): Promise<Document[]> {
   const rows = await db.getAllAsync<any>(`SELECT * FROM documents ORDER BY createdAt DESC`);
   return rows.map(r => ({
     id: r.id, name: r.name, type: r.type, folderId: r.folderId,
-    tags: JSON.parse(r.tags || '[]'), status: r.status,
+    tags: JSON.parse(r.tags || '[]'), pinned: !!r.pinned, status: r.status,
     meta: JSON.parse(r.meta || '{}'), createdAt: r.createdAt,
   }));
 }
@@ -69,11 +86,25 @@ export async function getDocuments(): Promise<Document[]> {
 export async function getDocument(id: string): Promise<Document | null> {
   const r = await db.getFirstAsync<any>(`SELECT * FROM documents WHERE id=?`, [id]);
   if (!r) return null;
-  return { ...r, tags: JSON.parse(r.tags || '[]'), meta: JSON.parse(r.meta || '{}') };
+  return {
+    ...r, tags: JSON.parse(r.tags || '[]'), pinned: !!r.pinned,
+    meta: JSON.parse(r.meta || '{}'),
+  };
+}
+
+// 钉住 / 取消钉住
+export async function setDocumentPinned(id: string, pinned: boolean) {
+  await db.runAsync(`UPDATE documents SET pinned=? WHERE id=?`, [pinned ? 1 : 0, id]);
+}
+
+// 覆盖式设置标签
+export async function setDocumentTags(id: string, tags: string[]) {
+  await db.runAsync(`UPDATE documents SET tags=? WHERE id=?`, [JSON.stringify(tags), id]);
 }
 
 export async function deleteDocument(id: string) {
   await db.runAsync(`DELETE FROM chunks WHERE docId=?`, [id]);
+  await db.runAsync(`DELETE FROM embeddings WHERE docId=?`, [id]); // 向量随文档一起清，别留孤儿
   await db.runAsync(`DELETE FROM documents WHERE id=?`, [id]);
 }
 
@@ -95,21 +126,88 @@ export async function getChunks(docId: string): Promise<Chunk[]> {
   return db.getAllAsync<Chunk>(`SELECT * FROM chunks WHERE docId=? ORDER BY seq`, [docId]);
 }
 
-// ---- 全文检索（MVP 用关键词，向量检索后置）----
-export async function searchChunks(query: string, limit = 8): Promise<any[]> {
-  const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 1);
-  if (terms.length === 0) return [];
-  const rows = await db.getAllAsync<any>(
-    `SELECT c.docId, c.content, c.pageNo, d.name as docName
-     FROM chunks c JOIN documents d ON d.id=c.docId`
+// ---- 检索数据源 ----
+// 检索层（retrieval.ts）需要全量 chunk 来建内存索引：BM25 依赖全量语料统计
+// （df / 平均长度），只取 top-N 是无法正确算 IDF 的。索引层按「内容指纹」缓存，
+// 所以这里可以放心全量拉取。
+export async function getAllChunksForIndex(): Promise<
+  Array<{ id: string; docId: string; content: string; pageNo?: number }>
+> {
+  return db.getAllAsync<any>(
+    `SELECT c.id, c.docId, c.content, c.pageNo
+     FROM chunks c JOIN documents d ON d.id = c.docId
+     ORDER BY c.docId, c.seq`
   );
-  const scored = rows.map(r => {
-    const text = (r.content || '').toLowerCase();
-    let score = 0;
-    for (const t of terms) if (text.includes(t)) score++;
-    return { ...r, score };
-  }).filter(r => r.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-  return scored;
+}
+
+// 取指定文档的文本块 —— 「钉住文档」每次问答自动带入时用
+export async function getChunksByDocs(docIds: string[], limit = 12): Promise<any[]> {
+  if (!docIds.length) return [];
+  return db.getAllAsync<any>(
+    `SELECT c.docId, c.content, c.pageNo, d.name as docName
+     FROM chunks c JOIN documents d ON d.id=c.docId
+     WHERE c.docId IN (${docIds.map(() => '?').join(',')})
+     ORDER BY c.docId, c.seq LIMIT ?`,
+    [...docIds, limit]
+  );
+}
+
+// ---- 语义检索向量（派生数据：丢了按原文本重算即可，故无需迁移与备份）----
+// float32 存 BLOB：512 维 = 2KB/块，一千块也就 2MB，比 JSON 省一半以上。
+
+export interface EmbeddingRow {
+  chunkId: string;
+  docId: string;
+  vec: Float32Array;
+}
+
+const f32ToBlob = (v: Float32Array) =>
+  new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength));
+
+const blobToF32 = (b: any): Float32Array => {
+  const u8: Uint8Array = b instanceof Uint8Array ? b : new Uint8Array(b || []);
+  // 拷一份再包成 Float32Array：sqlite 返回的 buffer 可能不是 4 字节对齐的
+  const copy = u8.slice();
+  if (copy.byteLength % 4 !== 0) return new Float32Array(0);
+  return new Float32Array(copy.buffer);
+};
+
+export async function putEmbeddings(
+  rows: Array<{ chunkId: string; docId: string }>,
+  vectors: number[][],
+  model: string
+): Promise<void> {
+  for (let i = 0; i < rows.length; i++) {
+    const vec = new Float32Array(vectors[i] || []);
+    await db.runAsync(
+      `INSERT OR REPLACE INTO embeddings (chunkId,docId,model,dim,vec) VALUES (?,?,?,?,?)`,
+      [rows[i].chunkId, rows[i].docId, model, vec.length, f32ToBlob(vec)]
+    );
+  }
+}
+
+/** 取向量。不传 docIds 则取全部（建内存索引用）。 */
+export async function getEmbeddings(docIds?: string[]): Promise<EmbeddingRow[]> {
+  if (docIds && docIds.length === 0) return [];
+  const where = docIds && docIds.length ? ` WHERE docId IN (${docIds.map(() => '?').join(',')})` : '';
+  const rows = await db.getAllAsync<any>(
+    `SELECT chunkId, docId, vec FROM embeddings${where}`,
+    docIds && docIds.length ? docIds : []
+  );
+  return rows.map((r) => ({ chunkId: r.chunkId, docId: r.docId, vec: blobToF32(r.vec) }));
+}
+
+/** 已索引的向量条数 + 用的模型（用于界面显示「语义已索引 N/M」与模型不一致检测） */
+export async function embeddingStats(): Promise<{ count: number; model: string | null; dim: number | null }> {
+  const r = await db.getFirstAsync<any>(`SELECT COUNT(*) AS n FROM embeddings`);
+  const m = await db.getFirstAsync<any>(`SELECT model, dim FROM embeddings LIMIT 1`);
+  return { count: r?.n || 0, model: m?.model ?? null, dim: m?.dim ?? null };
+}
+
+export async function deleteEmbeddingsByDoc(docId: string): Promise<void> {
+  await db.runAsync(`DELETE FROM embeddings WHERE docId=?`, [docId]);
+}
+
+export async function clearEmbeddings(): Promise<void> {
+  await db.runAsync(`DELETE FROM embeddings`);
 }

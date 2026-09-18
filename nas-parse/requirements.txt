@@ -1,0 +1,8 @@
+# 与服务端 app.py 对应。PyMuPDF / onnxruntime 都有 manylinux wheel，slim 镜像无需编译工具链。
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+pymupdf>=1.25
+python-docx>=1.1
+# 语义检索的嵌入推理：走 ONNX runtime，不依赖 torch，CPU 即可。
+# 模型（默认 BAAI/bge-small-zh-v1.5）在首次调用 /embed 时自动下载到 EMBED_CACHE_DIR。
+fastembed>=0.4,<1.0

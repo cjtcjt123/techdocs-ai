@@ -1,0 +1,32 @@
+# 部署到 fnOS（飞牛 NAS）：cd 到本目录 → docker compose up -d --build
+# 与 idcops-next 的 compose 互不干扰，各用各的端口。
+services:
+  nas-parse:
+    build: .
+    image: techdocs/nas-parse:1.1
+    container_name: nas-parse
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      # 留空 = 不鉴权（仅限内网）。想加一层保护就在同目录建 .env 写 AUTH_TOKEN=随便一串
+      - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - MAX_BYTES=67108864
+      # 嵌入模型：默认 bge-small-zh（中文 / 512 维）。换成别的模型后，手机端要重建语义索引
+      - EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-small-zh-v1.5}
+      - EMBED_CACHE_DIR=/models/fastembed
+      # 容器启动即在后台加载模型（失败不影响 /parse）
+      - EMBED_WARMUP=1
+    volumes:
+      # 模型缓存持久化，否则每次 docker compose up --build 都要重下
+      - ./models:/models
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request;urllib.request.urlopen('http://127.0.0.1:8787/health')
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

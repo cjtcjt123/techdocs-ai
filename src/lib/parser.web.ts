@@ -1,31 +1,31 @@
-// 文件解析层（web 预览降级）—— 浏览器无 expo-file-system，改用 fetch / File API
-import { DocType } from '../types';
+// 文件解析层（web 预览降级）—— 浏览器无 expo-file-system，改用 File API / fetch
+import { parseDocument, extToType, chunkText } from './parse-core';
+import type { ParseContext, ParseOutcome } from './parse-core';
 
-export { extToType, chunkText } from './parse-core';
+export { extToType, chunkText };
+export type { ParseContext, ParseOutcome };
 
-// web 端 DocumentPicker 返回的 uri 是 data:/blob: URL，可直接 fetch 出文本
-export async function extractText(uri: string, type: DocType): Promise<string | null> {
-  if (type !== 'txt' && type !== 'md') return null; // PDF/Word 仍走 partial 占位
-  if (!uri) return null;
+async function readBytes(asset: any): Promise<Uint8Array | null> {
   try {
-    const res = await fetch(uri);
-    const text = await res.text();
-    return text || null;
-  } catch {
-    return null;
-  }
-}
-
-// 统一入口：web 端 picker 会给原始 File 对象，优先用它（省去 data URL 解码）
-export async function readAssetText(asset: any, type: DocType): Promise<string | null> {
-  if (type !== 'txt' && type !== 'md') return null;
-  try {
-    if (asset?.file && typeof asset.file.text === 'function') {
-      const text = await asset.file.text();
-      return text || null;
+    // picker 直接给原始 File 对象时优先用它（省去 data URL 解码）
+    if (asset?.file && typeof asset.file.arrayBuffer === 'function') {
+      return new Uint8Array(await asset.file.arrayBuffer());
+    }
+    if (asset?.uri) {
+      const res = await fetch(asset.uri);
+      return new Uint8Array(await res.arrayBuffer());
     }
   } catch {
-    // 落到 uri 分支
+    // 落到 null
   }
-  return extractText(asset?.uri, type);
+  return null;
+}
+
+/** 解析一个 picker 资产 → 文本 + 来源 + 质量。 */
+export async function parseAsset(asset: any, ctx: ParseContext = {}): Promise<ParseOutcome> {
+  const name = asset?.name || '';
+  if (!name) return { text: null, source: 'none', quality: 0, note: '无法识别文件名' };
+  const bytes = await readBytes(asset);
+  if (!bytes) return { text: null, source: 'none', quality: 0, note: '读取文件失败' };
+  return parseDocument(bytes, name, ctx);
 }
