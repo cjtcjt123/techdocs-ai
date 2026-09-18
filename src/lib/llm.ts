@@ -1,6 +1,7 @@
 // LLM 调用层：三源路由（官方 API / 手机本地 / NAS 后端）
 // 官方与 NAS 均走 OpenAI 兼容 /chat/completions；Claude 走 /v1/messages 分支
 import { ModelConfig } from '../types';
+import { localAvailability, localChat, loadedModelId } from './local-llm';
 
 export interface ChatMsg {
   role: 'system' | 'user' | 'assistant';
@@ -22,39 +23,133 @@ function joinPath(base: string, path: string): string {
 }
 
 // 把 ModelConfig 解析成具体请求目标
+// 说明：'api' 来源统一覆盖云端厂商与自托管模型（如家里 NAS 上的 Ollama），
+// 二者本质都是 OpenAI 兼容 /chat/completions 接口，仅地址不同，无需分成两个来源。
 export function resolveTarget(cfg: ModelConfig): Resolved {
-  if (cfg.source === 'nas') {
-    return {
-      baseURL: cfg.baseURL || 'http://your-nas.local:11434/v1',
-      apiKey: cfg.apiKey || '',
-      model: cfg.model || 'qwen2.5',
-    };
+  if (cfg.source === 'local') {
+    // 本地模型不经过 HTTP：chat()/testModel() 里已经提前分流到 localChat，走不到这里
+    return { baseURL: '', apiKey: '', model: '' };
   }
-  if (cfg.source === 'official') {
-    switch (cfg.provider) {
-      case 'openai':
-        return { baseURL: 'https://api.openai.com/v1', apiKey: cfg.apiKey || '', model: cfg.model || 'gpt-4o-mini' };
-      case 'tongyi':
-        return { baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1', apiKey: cfg.apiKey || '', model: cfg.model || 'qwen-plus' };
-      case 'zhipu':
-        return { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: cfg.apiKey || '', model: cfg.model || 'glm-4-flash' };
-      case 'deepseek':
-        // 注意：DeepSeek 的接口地址【不带 /v1】，直接 https://api.deepseek.com/chat/completions
-        return { baseURL: 'https://api.deepseek.com', apiKey: cfg.apiKey || '', model: cfg.model || 'deepseek-chat' };
-      case 'claude':
-        return { baseURL: 'https://api.anthropic.com/v1', apiKey: cfg.apiKey || '', model: cfg.model || 'claude-3-5-haiku-latest', claude: true };
-      case 'custom':
-      default:
-        return { baseURL: cfg.baseURL || '', apiKey: cfg.apiKey || '', model: cfg.model || '' };
+  // source === 'api'（含旧 'official' / 'nas' 存量设置的兜底）
+  switch (cfg.provider) {
+    case 'openai':
+      return { baseURL: 'https://api.openai.com/v1', apiKey: cfg.apiKey || '', model: cfg.model || 'gpt-4o-mini' };
+    case 'tongyi':
+      return { baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1', apiKey: cfg.apiKey || '', model: cfg.model || 'qwen-plus' };
+    case 'zhipu':
+      return { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: cfg.apiKey || '', model: cfg.model || 'glm-4-flash' };
+    case 'deepseek':
+      // 注意：DeepSeek 的接口地址【不带 /v1】，直接 https://api.deepseek.com/chat/completions
+      return { baseURL: 'https://api.deepseek.com', apiKey: cfg.apiKey || '', model: cfg.model || 'deepseek-chat' };
+    case 'claude':
+      return { baseURL: 'https://api.anthropic.com/v1', apiKey: cfg.apiKey || '', model: cfg.model || 'claude-3-5-haiku-latest', claude: true };
+    case 'custom':
+    default:
+      // 自托管（NAS Ollama 等）：直接用自定义地址与模型名
+      return { baseURL: cfg.baseURL || '', apiKey: cfg.apiKey || '', model: cfg.model || '' };
+  }
+}
+
+// 把常见的 HTTP 状态码翻译成人话，用户自己就能定位问题（404 = 地址或模型名，401 = Key）
+function explainStatus(status: number): string {
+  switch (status) {
+    case 400: return '请求被拒（400）：多半是模型名不被该服务支持，或参数格式不对。';
+    case 401: return 'API Key 无效或未填写（401）。';
+    case 403: return '密钥无权访问该模型，或所在地域受限（403）。';
+    case 404: return '接口地址或模型名不对（404）。重点检查：Base URL 是否多写/少写 /v1，模型名是否拼错。';
+    case 429: return '额度不足或请求过频（429）。';
+    case 500:
+    case 502:
+    case 503: return `服务端异常（${status}），稍后重试。`;
+    default: return `请求被拒（${status}）。`;
+  }
+}
+
+export interface ConnTestResult {
+  ok: boolean;
+  ms: number;
+  detail: string;
+}
+
+// 测试连接：真实发一次最小请求，一次性验证「接口地址 / 密钥 / 模型名」三者是否对得上。
+// 与 chat() 的区别是只要求回两个字，成本几乎为零，且错误信息回显实际 URL 与状态码含义。
+export async function testModel(cfg: ModelConfig): Promise<ConnTestResult> {
+  const t0 = Date.now();
+  if (cfg.source === 'local') {
+    // 本地模型没有「连接」可测，改测「真能出字」——这才是用户关心的
+    const av = localAvailability();
+    if (!av.available) return { ok: false, ms: 0, detail: av.reason };
+    if (!loadedModelId()) {
+      return { ok: false, ms: 0, detail: '本地模型还没有加载。到「我的 → 模型管理」里加载一个再测。' };
+    }
+    try {
+      const reply = await localChat([{ role: 'user', content: '只回复两个字：可用' }], { maxTokens: 24 });
+      const ms = Date.now() - t0;
+      return {
+        ok: true,
+        ms,
+        detail: `本地模型正常（回：${reply.trim().slice(0, 20)}），首字耗时 ${ms}ms。本地推理速度取决于机型，通常明显慢于云端。`,
+      };
+    } catch (e: any) {
+      return { ok: false, ms: Date.now() - t0, detail: `本地模型调用失败：${e?.message || e}` };
     }
   }
-  // local 尚未接入
-  return { baseURL: '', apiKey: '', model: '' };
+  const t = resolveTarget(cfg);
+  if (!t.baseURL) return { ok: false, ms: 0, detail: '还没填接口地址：选「自定义」时必须填 Base URL。' };
+  if (!t.model) return { ok: false, ms: 0, detail: '还没填模型名。' };
+
+  const url = joinPath(t.baseURL, t.claude ? '/messages' : '/chat/completions');
+  // 不传 max_tokens（部分新模型已改用 max_completion_tokens，传了反而 400）；Claude 则必须传
+  const body = t.claude
+    ? { model: t.model, max_tokens: 16, messages: [{ role: 'user', content: '只回复两个字：可用' }] }
+    : { model: t.model, messages: [{ role: 'user', content: '只回复两个字：可用' }], stream: false };
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: t.claude
+        ? { 'Content-Type': 'application/json', 'x-api-key': t.apiKey, 'anthropic-version': '2023-06-01' }
+        : { 'Content-Type': 'application/json', Authorization: `Bearer ${t.apiKey}` },
+      body: JSON.stringify(body),
+    });
+    const ms = Date.now() - t0;
+    const txt = await res.text().catch(() => '');
+    if (!res.ok) {
+      return { ok: false, ms, detail: `${explainStatus(res.status)}\n请求地址：${url}\n原文：${txt.slice(0, 240)}` };
+    }
+    let reply = '';
+    try {
+      const data = JSON.parse(txt);
+      reply = t.claude
+        ? (data?.content || []).map((c: any) => c.text || '').join('')
+        : (data?.choices?.[0]?.message?.content || '');
+    } catch {
+      // 状态码 200 已足够说明连通，返回体解析失败不视为错误
+    }
+    return {
+      ok: true,
+      ms,
+      detail: `连接成功：${t.model} 正常响应${reply ? `（回：${reply.slice(0, 20).trim()}）` : ''}，耗时 ${ms}ms。`,
+    };
+  } catch (e: any) {
+    return {
+      ok: false,
+      ms: Date.now() - t0,
+      detail: `没连上（网络层失败）：${e?.message || e}\n请求地址：${url}\n若是自签 HTTPS 证书或纯 http 地址，iOS 会直接拒绝连接；局域网地址需与手机同一 WiFi。`,
+    };
+  }
 }
 
 export async function chat(cfg: ModelConfig, messages: ChatMsg[]): Promise<string> {
   if (cfg.source === 'local') {
-    throw new Error('手机本地模型尚未接入（MVP 后续迭代）。可切换为官方 API 或 NAS 后端。');
+    // 手机本地：走 llama.cpp（llama.rn）。三道门各自给出可直接照做的提示，
+    // 而不是笼统一句「不可用」——这三种失败原因用户要做的事完全不同。
+    const av = localAvailability();
+    if (!av.available) throw new Error(av.reason);
+    if (!loadedModelId()) {
+      throw new Error('还没有加载本地模型。请到「我的 → 模型管理」里选一个加载（第一次要先下载）。');
+    }
+    return localChat(messages);
   }
   const t = resolveTarget(cfg);
   if (!t.baseURL || !t.model) {
