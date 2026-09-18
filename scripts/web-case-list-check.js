@@ -354,6 +354,18 @@ async function main() {
   await closeSheet();
   check('关掉弹层后详情确实收了', (await sheetOpen()) === false);
 
+  // ---------- 失败案例的字段名（同一个缺陷的另一面）----------
+  // 提示词那边已经把它叫成「试过的做法（未成功）」，详情里若还写着「最终解决」，
+  // 同一份数据在两个地方就有两种说法 —— 用户看到的和模型看到的不是一回事。
+  console.log('\n=== 失败案例的详情字段名 ===');
+  const C3 = '冬季固化剂比例误判';
+  await openCase(C3, FIX3);
+  t = await bodyText();
+  check('失败案例详情用「试过的做法（未成功）」', /试过的做法（未成功）/.test(t));
+  check('失败案例详情不出现「最终解决」', !/最终解决/.test(t));
+  await shot('06b-失败详情');
+  await closeSheet();
+
   // ---------- 编辑：id / createdAt 必须不变 ----------
   console.log('\n=== 编辑 ===');
   await openCase(C1, FIX1);

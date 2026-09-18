@@ -103,6 +103,7 @@ const {
   CASE_PREFIX, caseDocId, isCaseDocId, caseIdOf, caseToText, caseCorpusRow,
   caseDisplayName, indexableCases, sortCases, caseStats, parseTags,
   validateCaseInput, draftFromTurn, OUTCOME_LABEL, OUTCOME_VERDICT,
+  caseHeader, caseSourceLabel, finalFixLabel, casesToMarkdown,
 } = casesLib;
 
 // ---------- A) 纯逻辑层 ----------
@@ -127,7 +128,7 @@ const base = {
 };
 
 const text = caseToText(base);
-ok('A4 文本带来源性质标记', text.includes('【已验证案例】'));
+ok('A4 文本带来源性质标记（成功档）', text.startsWith('【已验证案例 · 成功】'));
 ok('A5 文本带字段名（问「根因」也该命中）', text.includes('根因：脱泡时间不足'));
 ok('A6 文本带最终解决与结果', text.includes('最终解决：升温 60℃') && text.includes('结果：成功'));
 ok('A7 文本带记录日期（回答要说「你 08-12 的记录」）', text.includes('记录时间：2025-08-12'));
@@ -235,6 +236,75 @@ try {
   survived = false;
 }
 ok('B18 经验库数据异常时问答不抛错', survived);
+
+// ---------- C) 失败记录的分档标注 ----------
+//
+// 这一组是针对一个【真实存在过的缺陷】的回归：原来不管什么结果，caseToText 第一行
+// 一律是「【已验证案例】」，而提示词又写着「案例优先级最高、两者冲突时以案例为准」——
+// 于是一条「试过没成」的记录会戴着「你亲手验证过、以此为准」的身份进入之后的每一次问答，
+// 模型把一条已被证伪的做法当成权威结论推荐出去。用户看不到提示词，只会觉得
+// 「AI 怎么又让我照这个做，我明明记过它不行」。
+const failOnly = { ...base, id: 'cF', title: '低温 15℃ 下同样操作失败', outcome: 'fail' };
+const successText = caseToText(base);
+const partialText = caseToText({ ...base, outcome: 'partial' });
+const failText = caseToText(failOnly);
+
+ok('C1 成功档头部', successText.startsWith('【已验证案例 · 成功】'));
+ok('C2 部分成功单独一档', partialText.startsWith('【已验证案例 · 部分成功】'));
+ok('C3 失败档头部写明「此路不通，不要照做」', failText.startsWith('【已验证案例 · 失败 · 此路不通，不要照做】'));
+ok('C4 失败档不再与成功档共用头部', !failText.startsWith('【已验证案例】') && failText !== successText);
+ok('C5 失败案例的字段名不是「最终解决」', !failText.includes('最终解决') && failText.includes('试过的做法（未成功）：'));
+ok('C6 成功 / 部分成功仍用「最终解决」', successText.includes('最终解决：') && partialText.includes('最终解决：'));
+ok('C7 结果字段照旧进文本（检索仍要能按结果命中）', failText.includes('结果：失败'));
+ok('C8 outcome 缺失时退回中性头部，不误标失败', caseToText({ ...base, outcome: undefined }).startsWith('【已验证案例】'));
+
+eq('C9 来源标签：成功', caseSourceLabel('success'), '你已验证的经验案例');
+eq('C10 来源标签：部分成功', caseSourceLabel('partial'), '你已验证的经验案例（部分成功）');
+eq('C11 来源标签：失败', caseSourceLabel('fail'), '你的失败记录（试过，没成）');
+eq('C12 来源标签：outcome 缺失时不误标失败', caseSourceLabel(undefined), '你已验证的经验案例');
+eq('C13 caseHeader 兜底', caseHeader(undefined), '【已验证案例】');
+
+// 上下文拼装：成败两条同时出现时必须各标各的 —— 这是模型唯一能看到的依据
+const ctxMix = rag.buildContext([
+  { docId: caseDocId('c1'), docName: '案例 · CY1578 混合料气泡', content: successText, score: 1, kind: 'case', caseId: 'c1', outcome: 'success' },
+  { docId: caseDocId('cF'), docName: '案例 · 低温 15℃ 下同样操作失败', content: failText, score: 1, kind: 'case', caseId: 'cF', outcome: 'fail' },
+  { docId: 'd1', docName: 'HY1578 TDS', content: '真空脱泡：建议 40 min', score: 1, kind: 'doc' },
+]);
+ok('C14 上下文里成功案例标成「你已验证的经验案例」', ctxMix.includes('【你已验证的经验案例】'));
+ok('C15 上下文里失败案例标成「你的失败记录（试过，没成）」', ctxMix.includes('【你的失败记录（试过，没成）】'));
+ok('C16 成功标签只出现一次（没有串档）', (ctxMix.match(/【你已验证的经验案例】/g) || []).length === 1);
+ok('C17 文档仍是《》标注，未被案例标签污染', ctxMix.includes('《HY1578 TDS》'));
+
+// 真实链路：hit 必须带 outcome —— buildContext 的分档全靠它，掉了就静默退回老样子
+storage.__setCases([base, failOnly]);
+retrieval.invalidateRetrievalIndex();
+const hits2 = await rag.retrieve('真空脱泡 气泡', { topK: 8, docIds: ['d1'] });
+const hSucc = hits2.find((h) => h.caseId === 'c1');
+const hFail = hits2.find((h) => h.caseId === 'cF');
+ok('C18 真实召回里成功案例带 outcome=success', hSucc?.outcome === 'success', `got=${hSucc?.outcome}`);
+ok('C19 真实召回里失败案例带 outcome=fail', hFail?.outcome === 'fail', `got=${hFail?.outcome}`);
+ok('C20 真实召回的上下文里失败案例被标成「你的失败记录」', rag.buildContext(hits2).includes('【你的失败记录（试过，没成）】'));
+ok(
+  'C21 文档 hit 不带 outcome（只有案例有）',
+  hits2.some((h) => h.kind === 'doc') && hits2.filter((h) => h.kind === 'doc').every((h) => h.outcome === undefined)
+);
+
+// 同一个字段名在【四个渲染点】必须一致：语料 / 导出档案 / 详情弹层 / 表单。
+// 抽了 finalFixLabel() 就是为了别让它们分叉，这里把纯函数能覆盖的两个点钉住。
+eq('C22 finalFixLabel 三档', [finalFixLabel('fail'), finalFixLabel('success'), finalFixLabel(undefined)].join('|'),
+  '试过的做法（未成功）|最终解决|最终解决');
+const mdFail = casesToMarkdown([failOnly]);
+const mdOk = casesToMarkdown([base]);
+ok('C23 导出档案里失败案例也不叫「最终解决」', mdFail.includes('- 试过的做法（未成功）：') && !mdFail.includes('- 最终解决：'));
+ok('C24 导出档案里成功案例仍是「最终解决」', mdOk.includes('- 最终解决：'));
+eq('C25 校验提示按结果分档（失败档不说「怎么解决的」）', validateCaseInput({ outcome: 'fail' }),
+  '请填写「试过什么、后来怎样」—— 失败记录也有用，它拦住的是一次重复的失败');
+
+// 引用卡：来源卡上的徽章据此换成「失败案例」，否则用户看不出 AI 引的是失败记录
+const qAll = rag.hitsToQuotes(hits2);
+const qFail = qAll.find((x) => x.caseId === 'cF');
+ok('C26 引用卡带上 outcome（来源卡据此标「失败案例」）', qFail?.outcome === 'fail', `got=${qFail?.outcome}`);
+ok('C27 引用卡里的文档条目不带 outcome', qAll.filter((x) => x.kind === 'doc').every((x) => x.outcome === undefined));
 
 // ---------- 汇总 ----------
 const total = pass + fails.length;

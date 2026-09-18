@@ -349,7 +349,7 @@ async function main() {
   check('来源区标出「含经验案例」', /含经验案例\s*[1-9]/.test(t));
   // 只看【最后一条回答】的来源区：indexOf 会拿到第一条（那会儿还没有案例）。
   // 徽章判据用 `\n案例\n`（独立成行）—— 光找「案例」两字不行，案例正文的片段里
-  // 自带「【已验证案例】」，徽章根本没渲染也会通过（弱断言 = 假绿）。
+  // 自带「【已验证案例 · 部分成功】」，徽章根本没渲染也会通过（弱断言 = 假绿）。
   const iSrc = t.lastIndexOf('来源 · ');
   check('来源区出现「案例」徽章', iSrc >= 0 && /\n案例\s*\n/.test(t.slice(iSrc)), `iSrc@${iSrc}`);
   await shot('05-问2-命中案例');
@@ -365,12 +365,72 @@ async function main() {
   const sys = (prompt?.messages || []).find((m) => m.role === 'system')?.content || '';
   const ctx = sys.slice(sys.indexOf('【可引用资料】'));
   check('提示词里要求「以案例为准」', /以案例为准/.test(sys));
-  check('上下文含案例条目（带 [来源N] 标记，不是模板说明）', /\[来源\d+\] 【你已验证的经验案例】/.test(ctx));
-  const iCase = ctx.indexOf('【你已验证的经验案例】');
+  check('上下文含案例条目（带 [来源N] 标记，不是模板说明）', /\[来源\d+\] 【你已验证的经验案例（部分成功）】/.test(ctx));
+  const iCase = ctx.indexOf('【你已验证的经验案例（部分成功）】');
   const iDoc = ctx.indexOf('《HY1578 TDS.pdf》');
   check('案例排在原始资料之前', iCase >= 0 && iDoc >= 0 && iCase < iDoc, `case@${iCase} doc@${iDoc}`);
   check('案例正文带最终解决与结果', /最终解决：/.test(ctx) && /结果：部分成功/.test(ctx));
   check('案例正文带标签', /标签：/.test(ctx) && /气泡/.test(ctx));
+
+  // ---------- 失败记录的分档（回归：失败记录曾被当成「已验证经验」推荐出去）----------
+  //
+  // 这一段必须【在真实页面上跑】，只靠离线测试不够：提示词里的失败规则写在 store.ts 的
+  // sys 模板里，而 test-cases.mjs 只覆盖 cases.ts / rag.ts，够不到它。
+  // 而那段规则是整件事的落点 —— 上下文里标得再准，提示词没说清「失败记录该怎么用」，
+  // 模型照样会把它当成可照做的方案（这正是修之前的行为）。
+  console.log('\n=== 把那条案例改成「失败」，再问一次 ===');
+  const PROMPT_FILE = '/tmp/last-llm-prompt.json';
+  const flipped = await evaluate(`(() => {
+    const db = JSON.parse(localStorage.getItem(${JSON.stringify(NS)}) || '{}');
+    const c = (db.cases || [])[0];
+    if (!c) return 'NO_CASE';
+    c.outcome = 'fail';
+    localStorage.setItem(${JSON.stringify(NS)}, JSON.stringify(db));
+    return c.id;
+  })()`);
+  check('已把案例结果改成失败', flipped !== 'NO_CASE', String(flipped));
+  await send('Page.reload');
+  await sleep(WAIT_BOOT);
+
+  // 抓这一次的 prompt：删掉落盘文件 → 发问 → 等它重新出现。
+  // 不用数「来源 · N」等回答数 —— reload 后会话历史是否恢复不该影响这段的成败。
+  const askAndGrab = async () => {
+    try { fs.unlinkSync(PROMPT_FILE); } catch { /* 本来就不存在 */ }
+    await clickText('问答');
+    await sleep(1500);
+    await typeInto('输入问题', Q);
+    await sleep(400);
+    await clickText('发送');
+    for (let i = 0; i < 60; i++) {
+      if (fs.existsSync(PROMPT_FILE)) break;
+      await sleep(1000);
+    }
+    if (!fs.existsSync(PROMPT_FILE)) return null;
+    await sleep(300);
+    return JSON.parse(fs.readFileSync(PROMPT_FILE, 'utf8'));
+  };
+  const p2 = await askAndGrab();
+  check('桩模型收到了这次的请求', !!p2, p2 ? 'ok' : 'prompt 落盘文件没出现');
+  const sys2 = (p2?.messages || []).find((m) => m.role === 'system')?.content || '';
+  const ctx2 = sys2.slice(sys2.indexOf('【可引用资料】'));
+
+  // 先断言前提，再断言行为 —— 否则「失败案例没进来」会让下面几条全都“通过”（空转假绿）
+  check('失败案例确实进了上下文', /\[来源\d+\] 【你的失败记录（试过，没成）】/.test(ctx2));
+  check('上下文头部写明「此路不通，不要照做」', /【已验证案例 · 失败 · 此路不通，不要照做】/.test(ctx2));
+  check('失败案例的字段名换成了「试过的做法（未成功）」', !/最终解决：/.test(ctx2) && /试过的做法（未成功）：/.test(ctx2));
+
+  // 提示词侧：四条规则缺任何一条，都等于前面的分档白做
+  check('提示词写明失败记录不能当方案推荐', /绝不能当作解决方案推荐/.test(sys2));
+  check('提示词写明失败只代表「当时那个条件下」不成立', /当时那个条件下/.test(sys2));
+  check('提示词要求在条件不同时指出差异、可以再试', /可以再试/.test(sys2));
+  check('提示词要求在条件相同时明确劝阻', /明确劝阻/.test(sys2));
+  check('提示词给「以案例为准」补了失败记录那一层含义', /不是"照它做"/.test(sys2));
+
+  // 界面侧：来源卡必须给这条换徽章。用户扫一眼来源区就该看出「这条是没成的」，
+  // 而不是从一个笼统的「案例」徽章推断「AI 在推荐我这么做」。
+  const t3 = await waitFor(/\n失败案例\s*\n/, 20000, '来源卡的「失败案例」徽章');
+  check('来源卡把失败记录标成「失败案例」', /\n失败案例\s*\n/.test(t3));
+  await shot('06-问3-失败记录');
 
   // ---------- 界面自检（溢出 / 文字裁切）----------
   // 注意：SCAN_EXPR 返回的是【数组】，不是对象。把数组当对象取属性会得到空数组 → 检查永远通过（假绿）。
