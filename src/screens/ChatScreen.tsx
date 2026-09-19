@@ -81,11 +81,24 @@ export default function ChatScreen() {
     documents.forEach((d) => (d.tags || []).forEach((t) => s.add(t)));
     return Array.from(s).sort();
   })();
-  const scopeLabel = retrieval.onlyPinned
-    ? `仅钉住${pinnedDocs.length ? `（${pinnedDocs.length}）` : '（未钉任何文档）'}`
-    : retrieval.tags.length
-      ? `标签：${retrieval.tags.join('/')}`
-      : '全部资料';
+  // 「我自己的分类」—— 问答时限定只查某一个分类，避免两个行业的资料混着回答
+  const categories = settings.categories ?? [];
+  const catCounts = (() => {
+    const m = new Map<string, number>();
+    documents.forEach((d) => {
+      const c = d.meta?.category;
+      if (c) m.set(c, (m.get(c) || 0) + 1);
+    });
+    return m;
+  })();
+  // 分类是最粗的一层筛子，放在最前面显示 —— 用户第一眼要知道的是「这次在哪个范围里问」
+  const scopeLabel = retrieval.category
+    ? `分类：${retrieval.category}`
+    : retrieval.onlyPinned
+      ? `仅钉住${pinnedDocs.length ? `（${pinnedDocs.length}）` : '（未钉任何文档）'}`
+      : retrieval.tags.length
+        ? `标签：${retrieval.tags.join('/')}`
+        : '全部资料';
 
   // NAS 浏览里「带入对话」的文档，出现即并入附件并清空
   useEffect(() => {
@@ -291,8 +304,8 @@ export default function ChatScreen() {
           <View style={styles.chipRow}>
             <Chip
               label="全部资料"
-              on={!retrieval.onlyPinned && retrieval.tags.length === 0}
-              onPress={() => updateRetrieval({ onlyPinned: false, tags: [] })}
+              on={!retrieval.onlyPinned && retrieval.tags.length === 0 && !retrieval.category}
+              onPress={() => updateRetrieval({ onlyPinned: false, tags: [], category: undefined })}
             />
             <Chip
               label={`仅钉住${pinnedDocs.length ? ` ${pinnedDocs.length}` : ''}`}
@@ -300,6 +313,37 @@ export default function ChatScreen() {
               onPress={() => updateRetrieval({ onlyPinned: true, tags: [] })}
             />
           </View>
+
+          {/* 我自己的分类：单选。选了之后 AI 只在这个分类里找答案 ——
+              这是「两个行业的参数别混着回答」的开关，也是分类这个维度存在的理由。 */}
+          {categories.length > 0 && (
+            <>
+              <Text style={styles.scopePanelHead}>按分类（单选）</Text>
+              <View style={styles.chipRow}>
+                <Chip
+                  label="不限"
+                  on={!retrieval.category}
+                  onPress={() => updateRetrieval({ category: undefined })}
+                />
+                {categories.map((c) => {
+                  const n = catCounts.get(c) || 0;
+                  return (
+                    <Chip
+                      key={c}
+                      // 0 份要显式标「空」：选一个空分类去问答 = 检索命中 0 条，
+                      // 模型会凭空作答，而用户看不出原因。宁可丑一点也要说清。
+                      label={n ? `${c} ${n}` : `${c}（空）`}
+                      on={retrieval.category === c}
+                      onPress={() => updateRetrieval({ category: retrieval.category === c ? undefined : c })}
+                    />
+                  );
+                })}
+              </View>
+              <Text style={styles.scopeNote}>
+                选了分类，就只在这个分类的资料里检索（钉住的资料仍会带上）。
+              </Text>
+            </>
+          )}
 
           {tagOptions.length > 0 && (
             <>

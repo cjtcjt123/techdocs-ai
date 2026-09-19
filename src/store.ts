@@ -6,7 +6,7 @@ import { secureGet, secureSet } from './lib/secure';
 import {
   Document, Conversation, Message, ModelConfig, DataStrategy,
   Attachment, ComplianceResult, NasConnection, RetrievalConfig, SearchResult,
-  CaseRecord, CaseInput,
+  CaseRecord, CaseInput, DocKind,
 } from './types';
 import { listDir, downloadText, type NasEntry } from './lib/nas-webdav';
 import {
@@ -15,6 +15,7 @@ import {
   setDocumentPinned, setDocumentTags,
   getAllChunksForIndex, putEmbeddings, clearEmbeddings, embeddingStats,
   listCases, saveCase as saveCaseRow, deleteCase as deleteCaseRow,
+  getChunks,
 } from './lib/storage';
 import { searchAll, invalidateRetrievalIndex } from './lib/retrieval';
 import { sortCases, validateCaseInput } from './lib/cases';
@@ -26,6 +27,7 @@ import type { Hit } from './lib/rag';
 import { chat, ChatMsg } from './lib/llm';
 import { stopLocalChat } from './lib/local-llm';
 import { compliancePrompt, parseCompliance } from './lib/compliance';
+import { classifyDoc } from './lib/classify';
 import { loadSettings, saveSettings, AppSettings } from './lib/settings';
 import { setPrivacySwitches, setConfirmHook } from './lib/net-guard';
 
@@ -83,6 +85,20 @@ function cleanTags(tags: string[]): string[] {
 }
 
 /**
+ * 新导入的资料默认归入哪个分类。
+ *
+ * ⚠️ 必须校验「这个分类还在分类表里」：用户可能删了分类却没同步改默认值，
+ * 那时直接套用会把资料归进一个**界面上找不到的分类**（分组列表按 meta.category 渲染，
+ * 但分类管理里没这一项，用户会以为资料丢了）。宁可归入「未分类」。
+ * 导入 / NAS 同步两条路共用，避免一边校验一边不校验。
+ */
+function defaultCategoryOf(s: AppSettings): string | undefined {
+  const c = s.defaultCategory?.trim();
+  if (!c) return undefined;
+  return (s.categories || []).includes(c) ? c : undefined;
+}
+
+/**
  * 开一次可中断的生成。返回的 `done()` **必须**在 finally 里调，否则定时器会泄漏。
  * ⚠️ 没用 `AbortSignal.timeout()`：那是比较新的 API，Hermes 不保证有，手写更稳。
  */
@@ -122,20 +138,23 @@ function toChatHistory(msgs: Message[]): ChatMsg[] {
 
 // 根据设置解析出「本次问答用哪些资料」
 // - onlyPinned：只检索钉住的文档
+// - category：只检索归入该分类的文档
 // - tags 非空：只检索带这些标签的文档
 // - 都不设：全部资料
+// ⚠️ 三者是**取交集**，不是互斥：用户要的是「这次只在拉挤行业里问」，
+// 而钉住的资料照旧由 pinnedDocIds 强制带入（不受范围限制）。
 // pinnedDocIds 始终返回，钉住的资料每次问答都会强制带入
 function resolveScope(s: { documents: Document[]; settings: AppSettings }) {
   const cfg: RetrievalConfig = s.settings.retrieval ?? { topK: 8, onlyPinned: false, tags: [] };
   const pinnedDocIds = s.documents.filter((d) => d.pinned).map((d) => d.id);
-  let docIds: string[] | undefined;
-  if (cfg.onlyPinned) {
-    docIds = pinnedDocIds;
-  } else if (cfg.tags.length) {
-    docIds = s.documents
-      .filter((d) => (d.tags || []).some((t) => cfg.tags.includes(t)))
-      .map((d) => d.id);
-  }
+  const filtered =
+    cfg.onlyPinned || cfg.category || cfg.tags.length
+      ? s.documents
+          .filter((d) => (cfg.onlyPinned ? !!d.pinned : true))
+          .filter((d) => (cfg.category ? (d.meta?.category || '') === cfg.category : true))
+          .filter((d) => (cfg.tags.length ? (d.tags || []).some((t) => cfg.tags.includes(t)) : true))
+      : null;
+  const docIds = filtered ? filtered.map((d) => d.id) : undefined;
   return {
     topK: cfg.topK > 0 ? cfg.topK : 8,
     docIds,
@@ -224,6 +243,17 @@ interface State {
   batchTogglePin: (ids: string[], pinned: boolean) => Promise<void>;
   batchAddTags: (ids: string[], tags: string[]) => Promise<void>;
   allTags: () => string[];
+  /** 给一份已入库的资料补分类（早先导入的资料没有型号/类型字段） */
+  reclassifyDoc: (id: string) => Promise<void>;
+  /** 手工改分类：型号 / 文档类型 / 我自己的分类（category 传空串 = 清成「未分类」） */
+  updateDocClass: (id: string, patch: { model?: string; kind?: DocKind; category?: string }) => Promise<void>;
+  /**
+   * 批量归入某个分类（覆盖式：一份资料只归一个分类，所以这里是「设为」不是「追加」）。
+   * 传空串 = 批量清成未分类。
+   */
+  batchSetCategory: (ids: string[], category: string) => Promise<void>;
+  /** 批量给「还没分类」的资料补一次，已有分类的不动。返回处理了几份 */
+  reclassifyMissing: () => Promise<number>;
   runSearch: (q: string) => Promise<void>;
   clearSearch: () => void;
   updateRetrieval: (patch: Partial<RetrievalConfig>) => Promise<void>;
@@ -453,6 +483,8 @@ export const useStore = create<State>((set, get) => ({
       });
       if (res.canceled) { set({ importing: false }); return; }
       const ctx = parseContext(get());
+      // 「默认归入」在循环外取一次：它是本次导入的全局设定，不该每份重新读一遍设置
+      const defCat = defaultCategoryOf(get().settings);
       const failed: string[] = [];
       let skipped = 0;
       // 已入库的正文指纹。动态往里加 —— 本次选中的几份里如果彼此相同，也该只留一份。
@@ -465,11 +497,17 @@ export const useStore = create<State>((set, get) => ({
         const hash = out.text ? contentHash(out.text) : '';
         if (hash && seen.has(hash)) { skipped++; continue; }
         if (hash) seen.add(hash);
+        // 自动分类：型号与文档类型都从「文件名 → 正文开头」认，认不出就留空（不瞎猜）。
+        // 这两项是资料库分组的两个维度，缺了它们所有资料都会落进「未分组」。
+        const cls = classifyDoc(a.name, out.text || '');
         const doc: Document = {
           id: uid(), name: a.name, type, folderId: null, tags: [],
           status: out.text ? 'indexed' : 'partial',
           meta: {
             size: a.size,
+            model: cls.model,
+            kind: cls.kind,
+            category: defCat,
             parseSource: out.source,
             parseQuality: Number(out.quality.toFixed(2)),
             pages: out.pages,
@@ -575,6 +613,95 @@ export const useStore = create<State>((set, get) => ({
     const s = new Set<string>();
     get().documents.forEach((d) => (d.tags || []).forEach((t) => s.add(t)));
     return Array.from(s).sort();
+  },
+
+  /**
+   * 给一份已入库的资料补分类（型号 / 类型）。
+   *
+   * 存在理由：自动分类是导入时做的，**早先导入的资料没有这两个字段** ——
+   * 它们会一直挂在「未分类」里。用户点一下就该能用上，而不是必须重新导入一遍。
+   * 正文从 chunks 里取（已经解析过、存在库里），不重新解析文件。
+   */
+  async reclassifyDoc(id) {
+    const doc = get().documents.find((d) => d.id === id);
+    if (!doc) return;
+    let text = '';
+    try {
+      const chunks = await getChunks(id);
+      // 只拼前 3000 字：classifyDoc 本来就只扫开头，多取是浪费
+      for (const c of chunks) {
+        text += (c.content || '') + '\n';
+        if (text.length > 3000) break;
+      }
+    } catch {
+      // 取不到正文也能按文件名认（型号常写在文件名里），不当成失败
+    }
+    const cls = classifyDoc(doc.name, text);
+    await insertDocument({
+      ...doc,
+      meta: { ...doc.meta, model: cls.model || doc.meta?.model, kind: cls.kind || doc.meta?.kind },
+    });
+    set({ documents: await getDocuments() });
+  },
+
+  /** 手工改分类（型号 / 类型 / 我自己的分类）。自动识别只是给个起点，用户的判断优先。 */
+  async updateDocClass(id, patch) {
+    const doc = get().documents.find((d) => d.id === id);
+    if (!doc) return;
+    const meta = { ...doc.meta };
+    if (patch.model !== undefined) meta.model = patch.model.trim() || undefined;
+    if (patch.kind !== undefined) meta.kind = patch.kind;
+    if (patch.category !== undefined) meta.category = patch.category.trim() || undefined;
+    await insertDocument({ ...doc, meta });
+    set({ documents: await getDocuments() });
+  },
+
+  /**
+   * 批量归入分类。**覆盖式**而不是追加 —— 一份资料只归一个分类，
+   * 追加语义在这里不成立（而且会让「改分类」变成「越改越多」）。
+   * 写 N 条只刷新一次，理由同 batchAddTags。
+   */
+  async batchSetCategory(ids, category) {
+    if (!ids.length) return;
+    const cat = category.trim() || undefined;
+    try {
+      for (const id of ids) {
+        const doc = get().documents.find((d) => d.id === id);
+        if (!doc) continue;
+        await insertDocument({ ...doc, meta: { ...doc.meta, category: cat } });
+      }
+      set({ documents: await getDocuments() });
+    } catch (e: any) {
+      set({ documents: await getDocuments(), lastError: e?.message || '批量归类失败（可能只改了一部分）' });
+    }
+  },
+
+  /**
+   * 给所有「还没分类」的资料批量补一次。只处理缺字段的，已有分类的**不动**
+   * （用户手工改过的值不能被自动识别覆盖 —— 那会把用户的判断冲掉）。
+   */
+  async reclassifyMissing() {
+    const targets = get().documents.filter((d) => !d.meta?.model || !d.meta?.kind);
+    if (!targets.length) return 0;
+    try {
+      for (const doc of targets) {
+        let text = '';
+        try {
+          const chunks = await getChunks(doc.id);
+          for (const c of chunks) { text += (c.content || '') + '\n'; if (text.length > 3000) break; }
+        } catch { /* 同上：认不出就留空 */ }
+        const cls = classifyDoc(doc.name, text);
+        await insertDocument({
+          ...doc,
+          meta: { ...doc.meta, model: doc.meta?.model || cls.model, kind: doc.meta?.kind || cls.kind },
+        });
+      }
+      set({ documents: await getDocuments() });
+      return targets.length;
+    } catch (e: any) {
+      set({ documents: await getDocuments(), lastError: e?.message || '补分类失败（可能只处理了一部分）' });
+      return 0;
+    }
   },
 
   // 全局搜索：不经过模型，直接看命中的原文片段
@@ -889,6 +1016,8 @@ export const useStore = create<State>((set, get) => ({
       // NAS 同步是最容易撞重复的场景：同一个目录同步两次，以前就得到两份一模一样的资料
       //（每次都新建 uid，既不比名字也不比内容）。按正文指纹判重后，第二次同步是空操作。
       const seen = new Set(get().documents.map((d) => d.meta?.hash).filter(Boolean) as string[]);
+      // 同 importFiles：默认归入取一次，且必须还在分类表里
+      const defCat = defaultCategoryOf(get().settings);
       for (const f of files) {
         try {
           const text = await downloadText(conn, pw, f.href);
@@ -897,9 +1026,12 @@ export const useStore = create<State>((set, get) => ({
           if (seen.has(hash)) { skipped++; continue; }
           seen.add(hash);
           const type = extToType(f.name);
+          const cls = classifyDoc(f.name, text);
           const doc: Document = {
             id: uid(), name: f.name, type, folderId: null, tags: ['NAS'],
-            status: 'indexing', meta: { size: f.size, source: 'nas', hash }, createdAt: new Date().toISOString(),
+            status: 'indexing',
+            meta: { size: f.size, source: 'nas', hash, model: cls.model, kind: cls.kind, category: defCat },
+            createdAt: new Date().toISOString(),
           };
           await insertDocument(doc);
           const chunks = chunkText(text).map((c) => ({ ...c, docId: doc.id }));

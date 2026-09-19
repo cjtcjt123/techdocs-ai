@@ -3,10 +3,28 @@
 export type DocStatus = 'indexing' | 'indexed' | 'partial' | 'failed';
 export type DocType = 'pdf' | 'word' | 'md' | 'txt';
 export type ChunkType = 'title' | 'para' | 'table' | 'code';
+/**
+ * 文档类型 —— 资料库「按类型分组」用的维度。
+ * other = 认不出来（界面显示「未分类」，仍可由用户手工指定）。
+ */
+export type DocKind = 'tds' | 'spec' | 'report' | 'sds' | 'other';
 
 export interface DocMeta {
   source?: string;
   model?: string; // 产品型号（如 CY1578）
+  kind?: DocKind; // 文档类型（TDS / 规格书 / 检验报告 …），导入时自动识别，可手工改
+  /**
+   * 我自己的分类（如「拉挤行业」「高压行业」）—— **单选**，值只能来自用户自己建的分类表
+   * （`AppSettings.categories`）。
+   *
+   * 与 tags 的分工：tags 是随手打、可多个、会发散；category 是先建好固定几个、只挑一个，
+   * 目的是「两个行业的数据别混」。所以导入时**不自动猜**（行业靠关键词猜不准），
+   * 由用户建好后在设置里指定「新导入默认归入」，或事后批量指派。
+   *
+   * ⚠️ 分类被删除后，已归入的文档**保留这个值**（分组仍按名字显示，不丢信息）——
+   * 所以取值一律以 meta.category 为准，不要拿 categories 表去过滤分组。
+   */
+  category?: string;
   date?: string;
   size?: number;
   // ↓ 解析结果（导入时一次写入，用于资料库/详情页展示与排障）
@@ -40,6 +58,12 @@ export interface RetrievalConfig {
   topK: number; // 带几段上下文
   onlyPinned: boolean; // 只用钉住的文档
   tags: string[]; // 限定标签（空 = 全部资料）
+  /**
+   * 限定「我自己的分类」（空 = 不限）。
+   * 它和 onlyPinned / tags 是**同时生效**（取交集），不是互斥 —— 用户要的是
+   * 「这次只在拉挤行业里问」，钉住的资料照旧强制带入。
+   */
+  category?: string;
 }
 
 // 全局搜索结果（资料库搜索页：文档名命中 + 原文片段命中 + 经验库案例命中）

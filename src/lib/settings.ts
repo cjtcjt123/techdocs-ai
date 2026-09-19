@@ -55,6 +55,20 @@ export interface AppSettings {
    */
   exportFormat: 'markdown' | 'csv';
   retrieval: RetrievalConfig; // 检索范围与条数（问答时可快速调整）
+  /**
+   * 我自己的分类表（有序）。资料库「按分类分组」和问答「只查某个分类」都从这里取值。
+   *
+   * ⚠️ 分类名是**文档 meta.category 的取值来源**，删掉分类不会清掉已归入文档的这个值
+   * （见 DocMeta.category 的注释）—— 所以这里只管「有哪些可选」，不负责对存量文档做级联。
+   * 空数组 = 用户还没建分类，界面上「按分类分组」仍可用（那时只有「未分组」一堆）。
+   */
+  categories?: string[];
+  /**
+   * 新导入的资料默认归入哪个分类。空 / 不在 categories 里 = 不自动归类（默认行为）。
+   * 存在理由：一批资料通常同属一个行业，让用户每次导入都手动指派一次太烦；
+   * 但直接猜又猜不准 —— 所以做成「用户自己指定一个默认值」，不指定就不动。
+   */
+  defaultCategory?: string;
   /** 本地模型下载是否走国内镜像（hf-mirror）。默认走 —— 直连 huggingface.co 在国内大概率超时 */
   localMirror?: boolean;
 }
@@ -68,6 +82,20 @@ export function defaultSettings(): AppSettings {
     retrieval: { topK: 8, onlyPinned: false, tags: [] },
     localMirror: true,
   };
+}
+
+/**
+ * 分类名校验：必须是字符串、非空、且**真的在分类表里**。
+ *
+ * 用在两处（`retrieval.category` / `defaultCategory`）：分类被用户删掉后，这两个字段会变成
+ * 「指向一个已不存在的分类」—— 不清掉就会出现「按不存在的分类检索（命中 0 条，看起来像模型瞎答）」
+ * 或「新导入的资料归进一个界面上看不见的分类」。
+ */
+function sanitizeCategory(v: unknown, table: unknown): string | undefined {
+  if (typeof v !== 'string' || !v.trim()) return undefined;
+  const name = v.trim();
+  if (!Array.isArray(table)) return undefined;
+  return table.includes(name) ? name : undefined;
 }
 
 export async function loadSettings(): Promise<AppSettings> {
@@ -105,7 +133,16 @@ export async function loadSettings(): Promise<AppSettings> {
         ...(parsed.retrieval || {}),
         tags: Array.isArray(parsed.retrieval?.tags) ? parsed.retrieval.tags : [],
         topK: Number(parsed.retrieval?.topK) > 0 ? Number(parsed.retrieval.topK) : 8,
+        // 分类被删掉后，检索配置里可能还留着一个已经不存在的分类名 → 清掉，
+        // 否则问答会「按一个不存在的分类检索」→ 命中 0 条，用户看到的是「模型瞎答」。
+        category: sanitizeCategory(parsed.retrieval?.category, parsed.categories),
       },
+      // 分类表：保证是字符串数组（去空、去重、trim）。旧设置没有这个字段 → 空表。
+      categories: Array.isArray(parsed.categories)
+        ? Array.from(new Set(parsed.categories.filter((c: unknown) => typeof c === 'string').map((c: string) => c.trim()).filter(Boolean)))
+        : [],
+      // 默认分类必须还在分类表里 —— 分类被删了就失效，不然新导入会归进一个看不见的分类
+      defaultCategory: sanitizeCategory(parsed.defaultCategory, parsed.categories),
     };
   } catch {
     return { ...defaultSettings(), modelConfig: { ...defaultSettings().modelConfig, apiKey } };

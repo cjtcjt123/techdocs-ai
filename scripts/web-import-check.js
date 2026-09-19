@@ -224,6 +224,11 @@ async function main() {
   if (process.env.SEED_PARSE_ENDPOINT) patch.parseService = { endpoint: process.env.SEED_PARSE_ENDPOINT };
   if (EMBED) patch.embedding = { endpoint: EMBED };
   if (ASK) patch.modelConfig = { source: 'api', provider: 'custom', baseURL: llmBase, model: 'stub-model' };
+  // 预置「我自己的分类」+「新导入默认归入」，用来在真导入链上验自动归类
+  if (process.env.SEED_DEFAULT_CATEGORY) {
+    patch.categories = ['拉挤行业', '高压行业'];
+    patch.defaultCategory = process.env.SEED_DEFAULT_CATEGORY;
+  }
   if (Object.keys(patch).length) {
     await evaluate(`(() => {
       const NS = 'techdocs.v1.db';
@@ -280,6 +285,19 @@ async function main() {
   }
   const chars = (afterImport.match(/解析\s*(\d+)字/) || [])[1];
   results.push([`解析出的字符数 > 500（实测 ${chars || '解析不到'}）`, !!chars && Number(chars) > 500]);
+
+  if (process.env.SEED_DEFAULT_CATEGORY) {
+    // 「新导入自动归入默认分类」只能在**真导入链**上验：界面上设对了、importFiles 里忘了读
+    // defaultCategoryOf，用户看到的就是「新资料又跑到未分类里了」—— 光断言设置里存了值不算数。
+    const docs = await evaluate(`(() => {
+      try { return JSON.parse(localStorage.getItem('techdocs.v1.db') || '{}').documents || []; } catch { return []; }
+    })()`);
+    const got = docs[0]?.meta?.category || '(没有 category 字段)';
+    results.push([
+      `新导入自动归入默认分类（实测「${got}」）`,
+      got === process.env.SEED_DEFAULT_CATEGORY,
+    ]);
+  }
 
   if (KEYWORD) {
     console.log(`\n=== 搜索关键字「${KEYWORD}」 ===`);

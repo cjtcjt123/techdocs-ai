@@ -9,7 +9,8 @@ import { useStore } from '../store';
 import { useShallow } from 'zustand/react/shallow';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { DocStatus, Document } from '../types';
+import { DocStatus, Document, DocKind } from '../types';
+import { KIND_LABEL, KIND_ORDER } from '../lib/classify';
 
 const statusMeta: Record<DocStatus, { label: string; bg: string; fg: string }> = {
   indexing: { label: '索引中', bg: colors.primarySoft, fg: colors.primary },
@@ -30,6 +31,16 @@ const TAG_SUGGEST = [
 const ALL = '__all__';
 const PIN = '__pin__';
 const UNGROUPED = '未分组';
+
+/**
+ * 分组维度。四个维度都要、由用户切 —— 它们回答的不是同一个问题：
+ *   型号    查某套树脂的资料（CY1578 / HY5192 …），导入时自动认
+ *   类型    做比对时想按 TDS / 规格书 / 检验报告 看，导入时自动认
+ *   分类    **我自己的分类（拉挤行业 / 高压行业 …），单选、先建后选**
+ *   标签    随手打的自由标签，可多个
+ * ⚠️ 前三个是「一份资料一个值」的单值维度，只有标签是多值 —— 所以分组时标签取第一个。
+ */
+type GroupBy = 'model' | 'kind' | 'category' | 'tag';
 
 // 标签输入统一按「、」或逗号切分（中英文逗号都认），去空去重。
 // 单独抽出来是因为它有三处调用点（单份编辑 / 批量追加 / 保存），
@@ -54,6 +65,8 @@ export default function LibraryScreen() {
     attachNasToChat, closeNasDoc, syncFromNas, lastError,
     togglePin, updateDocTags, runSearch, clearSearch,
     batchRemoveDocs, batchAddTags,
+    reclassifyDoc, reclassifyMissing, updateDocClass,
+    batchSetCategory, updateSettings,
     searchQuery, searchResults, searching,
     cases,
   } = useStore(
@@ -76,7 +89,12 @@ export default function LibraryScreen() {
       togglePin: s.togglePin,
       updateDocTags: s.updateDocTags,
       batchRemoveDocs: s.batchRemoveDocs,
+      reclassifyDoc: s.reclassifyDoc,
+      reclassifyMissing: s.reclassifyMissing,
+      updateDocClass: s.updateDocClass,
       batchAddTags: s.batchAddTags,
+      batchSetCategory: s.batchSetCategory,
+      updateSettings: s.updateSettings,
       runSearch: s.runSearch,
       clearSearch: s.clearSearch,
       searchQuery: s.searchQuery,
@@ -93,11 +111,22 @@ export default function LibraryScreen() {
   const [tab, setTab] = useState<'docs' | 'cases'>('docs');
 
   const [filter, setFilter] = useState<string>(ALL);
+  // 分组维度：型号 / 文档类型 / 我的分类 / 自己的标签。四种都要，由用户切 —— 做比对时想按类型看，
+  // 查某套树脂时想按型号看，两者不能互相替代，所以不做「自动选一个」，而是给开关。
+  const [groupBy, setGroupBy] = useState<GroupBy>('model');
   const [q, setQ] = useState('');
   // 操作面板 / 标签编辑 / 重命名 的临时状态
   const [sheetDoc, setSheetDoc] = useState<Document | null>(null);
-  const [tagEdit, setTagEdit] = useState<{ id: string; text: string } | null>(null);
+  const [tagEdit, setTagEdit] = useState<{ id: string; text: string; model: string; kind: DocKind; category: string } | null>(null);
   const [renameTarget, setRenameTarget] = useState<{ id: string; text: string } | null>(null);
+  // 「我的分类」管理面板：新建 / 改名 / 删除 + 指定新导入默认归入哪个分类
+  const [catManage, setCatManage] = useState(false);
+  const [catDraft, setCatDraft] = useState('');
+  const [renamingCat, setRenamingCat] = useState<{ old: string; text: string } | null>(null);
+  // 批量归入分类的选择面板
+  const [batchCat, setBatchCat] = useState(false);
+  // 删除分类要确认：它牵动「新导入默认归入」和一批资料的归属，误删要重做归类
+  const [delCat, setDelCat] = useState<string | null>(null);
   // 单个删除也要先确认：这是不可逆操作，误触的代价是整份资料要重新导入+解析。
   const [delTarget, setDelTarget] = useState<Document | null>(null);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -136,11 +165,24 @@ export default function LibraryScreen() {
     });
   }, [documents, filter]);
 
-  // 按标签（无标签则按型号）分组
+  // 按当前维度分组。四种维度的取值来源不同：
+  //   型号     = meta.model（导入时自动识别）
+  //   类型     = meta.kind（同上）
+  //   我的分类 = meta.category（**用户自己建的，不自动猜**）
+  //   标签     = 用户自己打的第一个标签
+  // 拿不到值就落 UNGROUPED，并统一排在最后 —— 它该被看见（提示还有活没干），但不该挡在前面。
+  // ⚠️ 分类维度**不查 categories 表**：分类被删后已归入的文档仍保留原值，
+  //    用表过滤会让它们凭空消失（用户会以为资料丢了）。
   const groups = useMemo(() => {
+    const keyOf = (d: Document): string => {
+      if (groupBy === 'model') return d.meta?.model || UNGROUPED;
+      if (groupBy === 'kind') return d.meta?.kind ? KIND_LABEL[d.meta.kind] : UNGROUPED;
+      if (groupBy === 'category') return d.meta?.category || UNGROUPED;
+      return (d.tags && d.tags[0]) || UNGROUPED;
+    };
     const m = new Map<string, Document[]>();
     for (const d of visibleDocs) {
-      const k = (d.tags && d.tags[0]) || d.meta?.model || UNGROUPED;
+      const k = keyOf(d);
       if (!m.has(k)) m.set(k, []);
       m.get(k)!.push(d);
     }
@@ -149,7 +191,91 @@ export default function LibraryScreen() {
       if (b === UNGROUPED) return -1;
       return a.localeCompare(b);
     });
-  }, [visibleDocs]);
+  }, [visibleDocs, groupBy]);
+
+  /**
+   * 还没有分类的资料份数 —— 决定要不要给「补分类」入口。
+   * ⚠️ 「我的分类」维度不参与：行业靠关键词猜不准，猜错比不猜更糟，
+   *    所以这个维度只能由用户指派，也就无所谓「补」。
+   */
+  const unclassifiedCount = useMemo(() => {
+    if (groupBy === 'category') return 0;
+    return documents.filter((d) =>
+      groupBy === 'tag' ? !(d.tags || []).length : groupBy === 'model' ? !d.meta?.model : !d.meta?.kind
+    ).length;
+  }, [documents, groupBy]);
+
+  // ---- 我的分类 ----
+  const categories = useMemo(() => settings.categories ?? [], [settings.categories]);
+  const defaultCategory = settings.defaultCategory ?? '';
+  /** 已归入各分类的份数（分类管理面板里显示，删之前让用户知道会牵动几份） */
+  const catCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    documents.forEach((d) => {
+      const c = d.meta?.category;
+      if (c) m.set(c, (m.get(c) || 0) + 1);
+    });
+    return m;
+  }, [documents]);
+  const uncategorizedCount = useMemo(
+    () => documents.filter((d) => !d.meta?.category).length,
+    [documents],
+  );
+
+  /** 新建分类。重名 / 空名直接忽略（分类名是分组的 key，出现两个一样的等于分不开） */
+  const addCategory = async () => {
+    const name = catDraft.trim();
+    if (!name || categories.includes(name)) { setCatDraft(''); return; }
+    const next = [...categories, name];
+    // 第一个分类建出来就顺手设成默认：用户建它就是为了把新资料往里放
+    await updateSettings({ categories: next, defaultCategory: defaultCategory || name });
+    setCatDraft('');
+  };
+
+  /**
+   * 删除分类。**不动已归入文档的 meta.category**（值留着，分组照旧显示这一组）——
+   * 级联清空会让用户的归类工作白做一遍。要清就让用户自己批量指派。
+   */
+  const removeCategory = async (name: string) => {
+    const next = categories.filter((c) => c !== name);
+    await updateSettings({
+      categories: next,
+      // 默认分类指向被删的那个 → 失效，清掉（不清会让新导入归进一个看不见的分类）
+      defaultCategory: defaultCategory === name ? undefined : defaultCategory,
+    });
+    setDelCat(null);
+  };
+
+  /**
+   * 改名必须**级联改文档**：文档上存的是分类名字符串，只改表的话
+   * 已归入的资料会挂着一个表里没有的旧名（分组里出现「幽灵分组」，且无法再指派）。
+   */
+  const renameCategory = async (oldName: string, newName: string) => {
+    const name = newName.trim();
+    if (!name || name === oldName || categories.includes(name)) { setRenamingCat(null); return; }
+    const ids = documents.filter((d) => d.meta?.category === oldName).map((d) => d.id);
+    if (ids.length) await batchSetCategory(ids, name);
+    await updateSettings({
+      categories: categories.map((c) => (c === oldName ? name : c)),
+      defaultCategory: defaultCategory === oldName ? name : defaultCategory,
+    });
+    setRenamingCat(null);
+  };
+
+  /** 设 / 取消「新导入默认归入」。再点一次同一个 = 取消（改成不自动归类） */
+  const setDefaultCategory = async (name: string) => {
+    await updateSettings({ defaultCategory: defaultCategory === name ? undefined : name });
+  };
+
+  /**
+   * 单份编辑面板里的分类选项。
+   * ⚠️ 要带上「文档当前挂着、但表里已经没有」的分类名（分类被删了但值还在）——
+   * 不列出来的话，面板上这份资料的当前分类会凭空消失，用户会以为归类丢了。
+   */
+  const catOptions = useMemo(() => {
+    const cur = tagEdit?.category?.trim();
+    return cur && !categories.includes(cur) ? [cur, ...categories] : categories;
+  }, [tagEdit, categories]);
 
   // ---- 批量选择：派生值与动作 ----
   const selectedDocs = useMemo(
@@ -163,7 +289,7 @@ export default function LibraryScreen() {
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
 
   const exitSelect = () => {
-    setSelectMode(false); setSelected([]); setConfirmBatchDel(false); setBatchTag(null);
+    setSelectMode(false); setSelected([]); setConfirmBatchDel(false); setBatchTag(null); setBatchCat(false);
   };
 
   // 全选只作用于【当前筛选结果】，不是全库 —— 否则筛完「⭐ 钉住」再点全选，
@@ -190,6 +316,14 @@ export default function LibraryScreen() {
     try {
       // 同 batchDelete：一次刷新。追加语义在 store 的 batchAddTags 里（各文档原标签保留）
       await batchAddTags(selectedDocs.map((d) => d.id), add);
+    } finally { setBatchBusy(false); exitSelect(); }
+  };
+
+  /** 批量归入分类。传空串 = 清成未分类。 */
+  const applyBatchCategory = async (cat: string) => {
+    setBatchBusy(true);
+    try {
+      await batchSetCategory(selectedDocs.map((d) => d.id), cat);
     } finally { setBatchBusy(false); exitSelect(); }
   };
 
@@ -226,6 +360,8 @@ export default function LibraryScreen() {
     const m = d.meta || {};
     const parts: string[] = [];
     if (m.model) parts.push(m.model);
+    // other = 没认出来，显示它等于告诉用户「我不知道」——不如不占位置
+    if (m.kind && m.kind !== 'other') parts.push(KIND_LABEL[m.kind]);
     if (m.size) parts.push(formatSize(m.size));
     if (m.parseSource) {
       const src = m.parseSource === 'nas' ? 'NAS解析' : m.parseSource === 'local' ? '本地解析' : '未能提取文本';
@@ -386,6 +522,40 @@ export default function LibraryScreen() {
             </>
           ) : (
             <>
+              {/* 分组维度：型号 / 类型 / 我的分类 / 标签 四种都留着，用户自己切当前看哪个。
+                  右边的小按钮按维度变：
+                    · 型号 / 类型 → 「补分类 N」：早先导入的资料没有这两个字段，会一直挂未分组，
+                      与其让用户猜，不如把「还有 N 份没分」直接摆出来并给一键补。
+                    · 我的分类 → 「管理分类」：这个维度只能由用户自己建，所以给的是入口不是补。 */}
+              {documents.length > 0 && (
+                <View style={styles.groupByRow}>
+                  <Text style={styles.groupByLabel}>分组</Text>
+                  {([['model', '型号'], ['kind', '类型'], ['category', '分类'], ['tag', '标签']] as const).map(([k, label]) => (
+                    <Pressable
+                      key={k}
+                      onPress={() => setGroupBy(k)}
+                      style={[styles.chip, groupBy === k && styles.chipOn]}
+                    >
+                      <Text style={[styles.chipText, groupBy === k && styles.chipTextOn]}>{label}</Text>
+                    </Pressable>
+                  ))}
+                  {unclassifiedCount > 0 && (
+                    <Pressable
+                      hitSlop={6}
+                      onPress={() => void reclassifyMissing()}
+                      style={styles.miniBtn}
+                    >
+                      <Text style={styles.miniBtnT}>补分类 {unclassifiedCount}</Text>
+                    </Pressable>
+                  )}
+                  {groupBy === 'category' && (
+                    <Pressable hitSlop={6} onPress={() => setCatManage(true)} style={styles.miniBtn}>
+                      <Text style={styles.miniBtnT}>{categories.length ? '管理分类' : '＋ 新建分类'}</Text>
+                    </Pressable>
+                  )}
+                </View>
+              )}
+
               {/* 筛选条：全部 / 钉住 / 各标签 */}
               {documents.length > 0 && (
                 <ScrollView
@@ -447,27 +617,36 @@ export default function LibraryScreen() {
                 style={{ flex: 1 }}
               />
               <Button
-                label="加标签"
+                // 还没建分类时不该是个死按钮（点了没反应 = 又一个空壳开关）→ 直接送去建分类
+                label="归入分类"
                 variant="soft"
-                onPress={() => setBatchTag('')}
+                onPress={() => (categories.length ? setBatchCat(true) : setCatManage(true))}
                 disabled={!selected.length || batchBusy}
                 style={{ flex: 1, marginLeft: space.s2 }}
               />
             </View>
             <View style={[styles.batchRow, { marginTop: space.s2 }]}>
               <Button
+                label="加标签"
+                variant="soft"
+                onPress={() => setBatchTag('')}
+                disabled={!selected.length || batchBusy}
+                style={{ flex: 1 }}
+              />
+              <Button
                 label={allPinned ? '取消钉住' : '⭐ 钉住'}
                 variant="soft"
                 onPress={batchPin}
                 disabled={!selected.length || batchBusy}
-                style={{ flex: 1 }}
+                style={{ flex: 1, marginLeft: space.s2 }}
               />
+            </View>
+            <View style={{ marginTop: space.s2 }}>
               <Button
                 label={batchBusy ? '处理中…' : `删除${selected.length ? ` ${selected.length}` : ''}`}
                 variant="danger"
                 onPress={() => setConfirmBatchDel(true)}
                 disabled={!selected.length || batchBusy}
-                style={{ flex: 1, marginLeft: space.s2 }}
               />
             </View>
             <Text style={styles.batchHint}>
@@ -504,11 +683,21 @@ export default function LibraryScreen() {
               onPress={() => { void togglePin(sheetDoc.id); setSheetDoc(null); }}
             />
             <ActionRow
-              label="编辑标签 / 分组"
+              label="分类与标签"
               onPress={() => {
-                setTagEdit({ id: sheetDoc.id, text: (sheetDoc.tags || []).join('、') });
+                setTagEdit({
+                  id: sheetDoc.id,
+                  text: (sheetDoc.tags || []).join('、'),
+                  model: sheetDoc.meta?.model || '',
+                  kind: sheetDoc.meta?.kind || 'other',
+                  category: sheetDoc.meta?.category || '',
+                });
                 setSheetDoc(null);
               }}
+            />
+            <ActionRow
+              label="重新识别分类"
+              onPress={() => { void reclassifyDoc(sheetDoc.id); setSheetDoc(null); }}
             />
             <ActionRow
               label="重命名"
@@ -528,13 +717,69 @@ export default function LibraryScreen() {
         </View>
       )}
 
-      {/* ---------- 标签编辑面板 ---------- */}
+      {/* ---------- 分类与标签编辑面板 ---------- */}
       {tagEdit && (
         <View style={styles.overlay}>
           <Pressable style={{ flex: 1 }} onPress={() => setTagEdit(null)} />
           <View style={styles.sheet}>
-            <Text style={styles.sheetTitle}>编辑标签 / 分组</Text>
-            <Text style={styles.fieldHint}>多个标签用「、」或逗号分隔。第一个标签就是它所在的分组。</Text>
+            <Text style={styles.sheetTitle}>分类与标签</Text>
+            <Text style={styles.fieldHint}>型号与类型在导入时自动认，认错或没认出来就在这里改。分类是你自己建的，一份资料只归一个。</Text>
+
+            <Text style={styles.fieldLabel}>我的分类</Text>
+            {catOptions.length ? (
+              <View style={styles.kindRow}>
+                <Pressable
+                  onPress={() => setTagEdit({ ...tagEdit, category: '' })}
+                  style={[styles.chip, !tagEdit.category && styles.chipOn]}
+                >
+                  <Text style={[styles.chipText, !tagEdit.category && styles.chipTextOn]}>未分类</Text>
+                </Pressable>
+                {catOptions.map((c) => (
+                  <Pressable
+                    key={c}
+                    onPress={() => setTagEdit({ ...tagEdit, category: c })}
+                    style={[styles.chip, tagEdit.category === c && styles.chipOn]}
+                  >
+                    <Text style={[styles.chipText, tagEdit.category === c && styles.chipTextOn]}>{c}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : (
+              <Pressable
+                onPress={() => { setTagEdit(null); setCatManage(true); }}
+                style={[styles.miniBtn, { alignSelf: 'flex-start' }]}
+              >
+                <Text style={styles.miniBtnT}>＋ 新建分类（如：拉挤行业）</Text>
+              </Pressable>
+            )}
+
+            <Text style={styles.fieldLabel}>型号</Text>
+            <TextInput
+              value={tagEdit.model}
+              onChangeText={(t) => setTagEdit({ ...tagEdit, model: t })}
+              placeholder="例如：CY1578"
+              placeholderTextColor={colors.muted}
+              style={styles.field}
+              autoCorrect={false}
+            />
+
+            <Text style={styles.fieldLabel}>文档类型</Text>
+            <View style={styles.kindRow}>
+              {KIND_ORDER.map((k) => (
+                <Pressable
+                  key={k}
+                  onPress={() => setTagEdit({ ...tagEdit, kind: k })}
+                  style={[styles.chip, tagEdit.kind === k && styles.chipOn]}
+                >
+                  <Text style={[styles.chipText, tagEdit.kind === k && styles.chipTextOn]}>
+                    {KIND_LABEL[k]}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <Text style={styles.fieldLabel}>标签</Text>
+            <Text style={styles.fieldHint}>多个标签用「、」或逗号分隔。按「标签」分组时，第一个标签就是它所在的分组。</Text>
             <TextInput
               value={tagEdit.text}
               onChangeText={(t) => setTagEdit({ ...tagEdit, text: t })}
@@ -570,12 +815,147 @@ export default function LibraryScreen() {
               <Button
                 label="保存"
                 onPress={() => {
-                  void updateDocTags(tagEdit.id, splitTags(tagEdit.text));
+                  void (async () => {
+                    await updateDocTags(tagEdit.id, splitTags(tagEdit.text));
+                    await updateDocClass(tagEdit.id, { model: tagEdit.model, kind: tagEdit.kind, category: tagEdit.category });
+                  })();
                   setTagEdit(null);
                 }}
                 style={{ flex: 1, marginLeft: space.s2 }}
               />
             </View>
+          </View>
+        </View>
+      )}
+
+      {/* ---------- 我的分类：新建 / 改名 / 删除 / 设默认 ---------- */}
+      {catManage && (
+        <View style={styles.overlay}>
+          <Pressable style={{ flex: 1 }} onPress={() => setCatManage(false)} />
+          <View style={styles.sheet}>
+            <Text style={styles.sheetTitle}>我的分类</Text>
+            <Text style={styles.fieldHint}>
+              建好之后，导入的资料可以直接归进来；问答时也能只查某一个分类 —— 两个行业的参数不会混在一起回答。
+            </Text>
+
+            {categories.length === 0 && (
+              <Text style={styles.fieldHint}>还没有分类。先建一个，比如「拉挤行业」。</Text>
+            )}
+
+            {categories.map((c) => (
+              <View key={c} style={styles.catRow}>
+                <Pressable style={{ flex: 1 }} onPress={() => void setDefaultCategory(c)}>
+                  <Text style={styles.catName}>
+                    {defaultCategory === c ? '● ' : '○ '}{c}
+                    <Text style={styles.catCount}> · {catCounts.get(c) || 0} 份</Text>
+                  </Text>
+                </Pressable>
+                <Pressable hitSlop={6} onPress={() => setRenamingCat({ old: c, text: c })}>
+                  <Text style={styles.miniBtnT}>改名</Text>
+                </Pressable>
+                <Pressable hitSlop={6} onPress={() => setDelCat(c)}>
+                  <Text style={[styles.miniBtnT, { color: colors.red }]}>删除</Text>
+                </Pressable>
+              </View>
+            ))}
+
+            {categories.length > 0 && (
+              <Text style={styles.fieldHint}>
+                点左边的小圆点 = 设为「新导入默认归入」，再点一次取消。当前：{defaultCategory || '不自动归类'}。
+                {uncategorizedCount > 0 ? ` 还有 ${uncategorizedCount} 份未归类（可多选后点「归入分类」）。` : ''}
+              </Text>
+            )}
+
+            <Text style={styles.fieldLabel}>新建分类</Text>
+            <TextInput
+              value={catDraft}
+              onChangeText={setCatDraft}
+              placeholder="例如：拉挤行业"
+              placeholderTextColor={colors.muted}
+              style={styles.field}
+              autoCorrect={false}
+              onSubmitEditing={() => void addCategory()}
+            />
+            <View style={styles.sheetBtns}>
+              <Button label="关闭" variant="ghost" onPress={() => setCatManage(false)} style={{ flex: 1 }} />
+              <Button
+                label="＋ 添加"
+                onPress={() => void addCategory()}
+                disabled={!catDraft.trim() || categories.includes(catDraft.trim())}
+                style={{ flex: 1, marginLeft: space.s2 }}
+              />
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* ---------- 分类改名（要级联改已归入的资料）---------- */}
+      {renamingCat && (
+        <View style={styles.overlay}>
+          <Pressable style={{ flex: 1 }} onPress={() => setRenamingCat(null)} />
+          <View style={styles.sheet}>
+            <Text style={styles.sheetTitle}>重命名分类</Text>
+            <TextInput
+              value={renamingCat.text}
+              onChangeText={(t) => setRenamingCat({ ...renamingCat, text: t })}
+              placeholder="分类名"
+              placeholderTextColor={colors.muted}
+              style={styles.field}
+              autoFocus
+              autoCorrect={false}
+              onSubmitEditing={() => void renameCategory(renamingCat.old, renamingCat.text)}
+            />
+            <Text style={styles.fieldHint}>
+              已归入这个分类的 {catCounts.get(renamingCat.old) || 0} 份资料会一起改过来 ——
+              只改分类名不改资料的话，它们会挂着一个表里没有的旧名，之后就没法再指派了。
+            </Text>
+            <View style={styles.sheetBtns}>
+              <Button label="取消" variant="ghost" onPress={() => setRenamingCat(null)} style={{ flex: 1 }} />
+              <Button
+                label="保存"
+                onPress={() => void renameCategory(renamingCat.old, renamingCat.text)}
+                style={{ flex: 1, marginLeft: space.s2 }}
+              />
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* ---------- 删除分类确认 ---------- */}
+      {delCat && (
+        <View style={styles.overlay}>
+          <Pressable style={{ flex: 1 }} onPress={() => setDelCat(null)} />
+          <View style={styles.sheet}>
+            <Text style={styles.sheetTitle}>删除分类「{delCat}」？</Text>
+            <Text style={styles.fieldHint}>
+              {catCounts.get(delCat) || 0} 份资料已归入这个分类。删除分类**不会**清掉它们的归属 ——
+              这些资料仍会作为一组显示在资料库里，你可以再多选它们、指派到别的分类。
+            </Text>
+            <View style={styles.sheetBtns}>
+              <Button label="取消" variant="ghost" onPress={() => setDelCat(null)} style={{ flex: 1 }} />
+              <Button
+                label="删除分类"
+                variant="danger"
+                onPress={() => void removeCategory(delCat)}
+                style={{ flex: 1, marginLeft: space.s2 }}
+              />
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* ---------- 批量归入分类 ---------- */}
+      {batchCat && (
+        <View style={styles.overlay}>
+          <Pressable style={{ flex: 1 }} onPress={() => setBatchCat(false)} />
+          <View style={styles.sheet}>
+            <Text style={styles.sheetTitle}>把这 {selectedDocs.length} 份归入</Text>
+            <Text style={styles.fieldHint}>一份资料只归一个分类，所以这里是「设为」而不是「追加」。</Text>
+            {categories.map((c) => (
+              <ActionRow key={c} label={c} onPress={() => void applyBatchCategory(c)} />
+            ))}
+            <ActionRow label="未分类（清掉归类）" onPress={() => void applyBatchCategory('')} danger />
+            <Button label="取消" variant="ghost" onPress={() => setBatchCat(false)} style={{ marginTop: space.s2 }} />
           </View>
         </View>
       )}
@@ -779,6 +1159,15 @@ const styles = StyleSheet.create({
   clearText: { fontSize: 15, color: colors.muted },
   list: { flex: 1 },
   listInner: { paddingHorizontal: space.s3, paddingBottom: space.s2 },
+  groupByRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: space.s2 },
+  groupByLabel: { fontSize: 12, color: colors.muted, fontWeight: '700' },
+  miniBtn: {
+    marginLeft: 'auto', paddingVertical: 4, paddingHorizontal: 10,
+    borderRadius: radius.sm, borderWidth: 1, borderColor: colors.primary, backgroundColor: colors.primarySoft,
+  },
+  miniBtnT: { fontSize: 12, color: colors.primary, fontWeight: '700' },
+  fieldLabel: { fontSize: 12.5, fontWeight: '700', color: colors.text, marginTop: space.s2, marginBottom: 6 },
+  kindRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: space.s2 },
   chipsRow: { marginBottom: space.s2, flexGrow: 0 },
   chipsInner: { flexDirection: 'row', gap: 8, paddingRight: space.s3 },
   chip: {
@@ -820,6 +1209,13 @@ const styles = StyleSheet.create({
   checkMark: { fontSize: 12, lineHeight: 14, fontWeight: '700', color: '#fff' },
   batchRow: { flexDirection: 'row' },
   batchHint: { fontFamily: mono, fontSize: 10.5, color: colors.muted, marginTop: space.s2, textAlign: 'center' },
+  // 分类管理里的一行：●/○ 默认标记 + 分类名 + 份数，右侧改名 / 删除
+  catRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    paddingVertical: 9, borderBottomWidth: 1, borderBottomColor: colors.border,
+  },
+  catName: { fontSize: 13.5, fontWeight: '600', color: colors.text },
+  catCount: { fontFamily: mono, fontSize: 10.5, fontWeight: '400', color: colors.muted },
   warnText: { fontSize: 12, color: colors.red, lineHeight: 18, marginBottom: space.s2 },
   delItem: { fontSize: 12.5, color: colors.text, lineHeight: 19 },
   nameRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
