@@ -137,6 +137,13 @@ export async function getAllChunksForIndex(): Promise<
 
 // 语料指纹（见 storage.ts 同名函数的注释：口径是 Σ(长度 + 1)）。
 // web 端没有 SQL，但同样不必为了两个数字去 map 出一整个新数组。
+// 与原生实现同语义：不限定文档 = 全库；限定 = 只数这些文档的块（见 storage.ts 的注释）
+export async function countChunks(docIds?: string[]): Promise<number> {
+  const cs = load().chunks;
+  if (docIds && docIds.length === 0) return 0;
+  return docIds ? cs.filter((c) => docIds.includes(c.docId)).length : cs.length;
+}
+
 export async function getChunksFingerprint(): Promise<{ count: number; chars: number }> {
   const cs = load().chunks;
   let chars = 0;

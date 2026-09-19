@@ -238,7 +238,13 @@ export async function testEmbedding(cfg: EmbeddingConfig, timeoutMs = 20000): Pr
 }
 
 /** 余弦相似度。两边模长都算，不假设服务端已归一化 */
-export function cosine(a: number[], b: number[]): number {
+/**
+ * 余弦相似度。参数放宽到 `ArrayLike<number>` 是刻意的 ——
+ * 库里存的向量是 `Float32Array`（BLOB 读出来直接就是它），调用方若被迫先 `Array.from()`
+ * 转一次，每个向量都要新建一个等长数组：一次检索几千条就是几千次分配，纯浪费。
+ * 只读下标，所以放宽签名不会有任何行为差异。
+ */
+export function cosine(a: ArrayLike<number>, b: ArrayLike<number>): number {
   const n = Math.min(a.length, b.length);
   if (!n) return 0;
   let dot = 0;

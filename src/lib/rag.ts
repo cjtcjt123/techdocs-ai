@@ -9,7 +9,7 @@
 //   BM25 分是无上界的，余弦相似度是 0~1，两者量纲不同，硬加权需要拍脑袋定归一化系数，
 //   换个语料就得重调。RRF 只依赖【排名】不依赖分数，天然免疫量纲问题，
 //   且让「多路都排前面」的结果胜出 —— 这正是混合检索想要的。
-import { searchChunks, semanticSearch, listIndexableCases } from './retrieval';
+import { searchChunks, semanticSearch, listIndexableCases, docNameMap } from './retrieval';
 import { getChunksByDocs } from './storage';
 import type { KeywordHit } from './keyword';
 import { caseIdOf, isCaseDocId, caseSourceLabel } from './cases';
@@ -156,7 +156,10 @@ export async function retrieve(query: string, opts?: RetrieveOpts): Promise<Hit[
     // 拿不到值的后果是失败记录被静默标成正常经验，而那正是这次要修的 bug。
     const caseOutcomes = new Map((await listIndexableCases()).map((c) => [c.id, c.outcome]));
     const toHit = makeToHit(caseOutcomes);
-    const kw = await searchChunks(query, Math.max(topK * 3, 20), { docIds: opts?.docIds });
+    // 名字只查一次、两路共用：关键词路和语义路都要回填 docName，各自查一次就多 4 次 DB 读。
+    // 名字是「实时值优先」的（改名要立刻生效），所以只在这次问答内共享，不进跨次缓存。
+    const names = await docNameMap();
+    const kw = await searchChunks(query, Math.max(topK * 3, 20), { docIds: opts?.docIds, names });
     // 案例与文档来自同一次关键词召回（同一份语料），这里按虚拟 id 前缀拆成两路分别给权重。
     // 拆路的另一个好处：即便某条案例在整体 BM25 里排在第 30 位，它在「案例路」里的名次
     // 仍可能靠前 —— 等于让经验库内部先自己比一轮，再和文档比。
@@ -172,6 +175,7 @@ export async function retrieve(query: string, opts?: RetrieveOpts): Promise<Hit[
         const sem = await semanticSearch(query, Math.max(topK * 3, 20), {
           docIds: opts.docIds,
           embedding: opts.embedding,
+          names,
         });
         if (sem.length) lists.push({ name: 'semantic', weight: DOC_WEIGHT, hits: sem.map(toHit) });
       } catch (e) {
@@ -195,17 +199,41 @@ export async function retrieve(query: string, opts?: RetrieveOpts): Promise<Hit[
 // 才有可能在两者冲突时以案例为准（提示词里另有明文要求）。
 // 案例内部还要再分一层：成功经验 vs 失败记录 —— 两者都该以「用户实测事实」的身份出现，
 // 但只有前者能被推荐照做（理由见 cases.ts 的 CASE_HEADER）。
+/**
+ * 上下文的字符预算。超了就截断 —— 但必须**在上下文里明说截断了**，
+ * 否则模型会以为「资料里就这些」，用户也无从知道答案为什么不完整。
+ *
+ * 取 12k 字符的依据：中文 1 字≈1 token，12k ≈ 12k token；加上提示词与会话历史，
+ * 常见模型的输入窗口还能舒服地装下。再往上加，首字延迟和费用都在涨，
+ * 而命中质量并不会跟着变好 —— 排在第 12 段之后的内容，本来也很少被真正引用。
+ */
+const CTX_BUDGET_CHARS = 12_000;
+
 export function buildContext(hits: Hit[]): string {
   if (hits.length === 0) return '（资料库暂无相关内容）';
-  return hits
-    .map((h, i) => {
-      if (h.kind === 'case') {
-        const title = (h.docName || '').replace(/^案例 · /, '');
-        return `[来源${i + 1}] 【${caseSourceLabel(h.outcome)}】${title}\n${h.content}`;
+  const out: string[] = [];
+  let used = 0;
+  let cut = 0;
+  for (let i = 0; i < hits.length; i++) {
+    const h = hits[i];
+    const block =
+      h.kind === 'case'
+        ? `[来源${i + 1}] 【${caseSourceLabel(h.outcome)}】${(h.docName || '').replace(/^案例 · /, '')}\n${h.content}`
+        : `[来源${i + 1}] 《${h.docName}》${h.pageNo ? `第${h.pageNo}页` : ''}${h.pinned ? '（钉住资料）' : ''}\n${h.content}`;
+    if (used + block.length > CTX_BUDGET_CHARS) {
+      // 第一条就超预算时也要带上：宁可截断它，也不能给出一份完全没有内容的上下文
+      if (out.length === 0) {
+        out.push(block.slice(0, Math.max(0, CTX_BUDGET_CHARS)) + '…（本段已截断）');
+        used = CTX_BUDGET_CHARS;
       }
-      return `[来源${i + 1}] 《${h.docName}》${h.pageNo ? `第${h.pageNo}页` : ''}${h.pinned ? '（钉住资料）' : ''}\n${h.content}`;
-    })
-    .join('\n\n');
+      cut = hits.length - i;
+      break;
+    }
+    out.push(block);
+    used += block.length + 2; // +2 = 段间空行
+  }
+  const head = cut ? `（上下文已达长度上限，后面 ${cut} 段未纳入本次回答）\n\n` : '';
+  return head + out.join('\n\n');
 }
 
 // 把命中转成引用卡

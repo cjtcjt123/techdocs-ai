@@ -172,6 +172,27 @@ export async function getAllChunksForIndex(): Promise<
  * chars 的口径必须和 retrieval.ts 里 fingerprintOf() 一致：Σ(长度 + 1)。
  * 那个 +1 不是笔误，是让「1 块 10 字」与「2 块 9 字」不会撞成同一个指纹。
  */
+/**
+ * 统计 chunk 条数（可选限定文档范围）。
+ *
+ * 存在理由：问答页那句「已检索 N 块」必须报**本次实际扫过的块数**，
+ * 而不是全局索引总量 —— 用户把范围收成「仅钉住」或「只查某个分类」时，
+ * 报全库块数等于在说一句与本次问答无关的话（且会让人以为那几万块都翻过）。
+ * 范围收窄时这条 SQL 更轻，不是负担。
+ */
+export async function countChunks(docIds?: string[]): Promise<number> {
+  if (docIds && docIds.length === 0) return 0;
+  const r = docIds
+    ? await db.getFirstAsync<any>(
+        `SELECT COUNT(*) AS n FROM chunks WHERE docId IN (${docIds.map(() => '?').join(',')})`,
+        docIds
+      )
+    : await db.getFirstAsync<any>(
+        `SELECT COUNT(*) AS n FROM chunks c JOIN documents d ON d.id = c.docId`
+      );
+  return Number(r?.n ?? 0);
+}
+
 export async function getChunksFingerprint(): Promise<{ count: number; chars: number }> {
   const r = await db.getFirstAsync<any>(
     `SELECT COUNT(*) AS count,

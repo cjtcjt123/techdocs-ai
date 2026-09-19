@@ -165,8 +165,14 @@ async function getVectorIndex() {
   return cachedVectors;
 }
 
-/** 文档名 / 案例名实时回填。名字刻意不进缓存 —— 改名要立刻生效 */
-async function docNameMap(): Promise<Map<string, string>> {
+/**
+ * 文档名 / 案例名实时回填。名字刻意不进缓存 —— 改名要立刻生效。
+ *
+ * 对外导出是为了**一次问答只算一次**：问答要同时跑关键词路和语义路，两路都要回填名字，
+ * 各算一次就多出 2 次 `getDocuments()` + 2 次案例读取（一次问答 4 次 DB 查询白花）。
+ * 由 rag 算好后通过 `opts.names` 传下来，单路直调（如全局搜索）不传则自己算。
+ */
+export async function docNameMap(): Promise<Map<string, string>> {
   const docs = await getDocuments();
   const m = new Map(docs.map((d) => [d.id, d.name]));
   for (const c of await loadCaseCorpus()) m.set(caseDocId(c.id), caseDisplayName(c));
@@ -185,14 +191,14 @@ async function docNameMap(): Promise<Map<string, string>> {
 export async function searchChunks(
   query: string,
   limit = 8,
-  opts?: { docIds?: string[] }
+  opts?: { docIds?: string[]; names?: Map<string, string> }
 ): Promise<KeywordHit[]> {
   if (!(query || '').trim()) return [];
   const idx = await getKeywordIndex();
   const scope = opts?.docIds ? [...opts.docIds, ...cachedCases.map((c) => caseDocId(c.id))] : undefined;
   const hits = idx.search(query, limit, scope);
   if (!hits.length) return [];
-  const names = await docNameMap();
+  const names = opts?.names ?? (await docNameMap());
   for (const h of hits) h.docName = names.get(h.docId) || '(已删除)';
   return hits;
 }
@@ -209,7 +215,7 @@ export async function searchChunks(
 export async function semanticSearch(
   query: string,
   limit = 10,
-  opts?: { docIds?: string[]; embedding?: EmbeddingConfig }
+  opts?: { docIds?: string[]; embedding?: EmbeddingConfig; names?: Map<string, string> }
 ): Promise<KeywordHit[]> {
   const cfg = opts?.embedding;
   if (!cfg?.endpoint || !(query || '').trim()) return [];
@@ -224,7 +230,7 @@ export async function semanticSearch(
 
   await loadCorpus();
   const byId = new Map(cachedRows.map((r) => [r.id, r]));
-  const names = await docNameMap();
+  const names = opts?.names ?? (await docNameMap());
   const allow = opts?.docIds && opts.docIds.length ? new Set(opts.docIds) : null;
 
   const scored: KeywordHit[] = [];
@@ -239,7 +245,7 @@ export async function semanticSearch(
       docName: names.get(row.docId) || '(已删除)',
       content: row.content,
       pageNo: row.pageNo,
-      score: cosine(qv, Array.from(v.vec)),
+      score: cosine(qv, v.vec),
       matched: [],
     });
   }
