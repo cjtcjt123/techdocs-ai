@@ -17,6 +17,16 @@ export interface DownloadProgress {
 
 export type ProgressFn = (p: DownloadProgress) => void;
 
+// 与原生版同签名：web 上下载本来就不成立（见 WEB_REASON），所以「取消」恒为无事可做。
+// 必须与原生版成对导出 —— 界面 import 的名字两边都得有，否则 web bundle 直接编译不过。
+export const DOWNLOAD_CANCELLED = 'DOWNLOAD_CANCELLED';
+export function isDownloading(): boolean {
+  return false;
+}
+export function cancelActiveDownload(): boolean {
+  return false;
+}
+
 // v2：演示集加了「无来源记录」一条。改版本号是为了让浏览器里缓存的旧演示数据失效重写
 const KEY = 'techdocs.localModels.demo.v2';
 const MiB = 1024 ** 2;

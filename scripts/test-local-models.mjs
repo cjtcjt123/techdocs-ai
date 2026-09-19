@@ -7,7 +7,7 @@
 //
 // 跑法：node scripts/test-local-models.mjs
 
-const { MODEL_CATALOG, SOURCE_LABEL, parseGgufHeader, looksLikeGguf, quantLabel, tierForMemory, fitForModel, usableBytes, pickForTier, formatBytes, findCatalogModel } = await import('../src/lib/local-models.ts');
+const { MODEL_CATALOG, SOURCE_LABEL, parseGgufHeader, looksLikeGguf, quantLabel, tierForMemory, fitForModel, usableBytes, pickForTier, formatBytes, findCatalogModel, systemModelStatus } = await import('../src/lib/local-models.ts');
 
 let pass = 0;
 let fail = 0;
@@ -262,6 +262,35 @@ console.log('\n=== 9. 来源标签完整性 ===');
   }
   eq('标签表里没有多余项', Object.keys(SOURCE_LABEL).length, ALL_SOURCES.length);
 }
+
+console.log('\n=== 10. 系统内置模型的状态是真判断，不是写死的文案 ===');
+{
+  // 这一条的来历：界面上原本写死「本机不可用」，同屏注释却承诺「换上支持的机型后自动变可用」——
+  // 代码里没有任何一处会因换机型而改变。承诺了做不到的事，比不说更糟。
+  // 所以状态必须由真实输入算出，且三种状态要真的分得开（用户要做的事完全不同）。
+  const G = 1024 ** 3;
+  const nonIos = systemModelStatus({ os: 'android', major: 34, memBytes: 12 * G });
+  eq('非 iOS → unsupported', nonIos.state, 'unsupported');
+  ok('非 iOS 的标签不是「本机不可用」这种死话', nonIos.label !== '本机不可用', nonIos.label);
+
+  const oldIos = systemModelStatus({ os: 'ios', major: 18, memBytes: 8 * G });
+  eq('iOS 18（< 26）→ unsupported', oldIos.state, 'unsupported');
+  ok('低版本要说清差的是什么', /26/.test(oldIos.label + oldIos.detail), oldIos.label);
+
+  const oldPhone = systemModelStatus({ os: 'ios', major: 26, memBytes: 6 * G });
+  eq('iOS 26 但内存 6G（机型不够）→ unsupported', oldPhone.state, 'unsupported');
+
+  // 条件都满足时，如实说「还没接上」，不能假装可用 —— 原生调用通路确实还没写
+  const ready = systemModelStatus({ os: 'ios', major: 26, memBytes: 8 * G });
+  eq('条件满足 → not-integrated（不是「可用」）', ready.state, 'not-integrated');
+  ok('待接入要讲清「不需要下载」（它本来就在系统里）', /不需要下载/.test(ready.detail), ready.detail);
+
+  // 判据必须随输入变化：同一段代码换一组输入就得换一个结论 —— 写死的话这条过不了
+  const a = systemModelStatus({ os: 'ios', major: 26, memBytes: 8 * G }).label;
+  const b = systemModelStatus({ os: 'ios', major: 18, memBytes: 8 * G }).label;
+  ok('版本不同 → 结论不同（证明不是常量）', a !== b, `${a} vs ${b}`);
+}
+
 
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`);
 if (fail) {

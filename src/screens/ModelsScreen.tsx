@@ -10,7 +10,9 @@
 //   ② 导入格式不对**明确指出**问题是什么，不说「失败」；
 //   ③ 删除必须二次确认，且是逐项确认，没有「全清空」。
 import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import {
+  ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View, Platform,
+} from 'react-native';
 import * as Device from 'expo-device';
 import { useStore } from '../store';
 import { colors, mono, radius, shadow, space } from '../theme';
@@ -24,6 +26,7 @@ import {
   fitForModel,
   formatBytes,
   pickForTier,
+  systemModelStatus,
   tierForMemory,
   usableBytes,
   type CatalogModel,
@@ -36,6 +39,9 @@ import {
   freeSpace,
   importModelFromFiles,
   listLocalModels,
+  cancelActiveDownload,
+  isDownloading,
+  DOWNLOAD_CANCELLED,
   type DownloadProgress,
 } from '../lib/model-store';
 
@@ -65,6 +71,12 @@ export default function ModelsScreen() {
 
   const avail = localAvailability();
   const totalMem = Number(Device.totalMemory) || 0;
+  // 系统内置模型的状态由**真判断**得出（平台 / 系统版本 / 内存档位），不是写死的文案
+  const sysStatus = systemModelStatus({
+    os: Platform.OS,
+    major: Number(String((Platform as any).Version).split('.')[0]) || 0,
+    memBytes: totalMem,
+  });
   const tier = tierForMemory(totalMem);
   const recommend = pickForTier(tier);
   const usedBytes = installed.reduce((n, r) => n + (r.bytes || 0), 0);
@@ -98,7 +110,9 @@ export default function ModelsScreen() {
       setTip(`「${rec.name}」已下载完成（${formatBytes(rec.bytes)}${rec.quant ? ` · ${rec.quant}` : ''}）。点「加载」就能用于问答。`);
       await refresh();
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      // 取消不是错误：说「下载失败」会让用户以为网络或地址有问题
+      if (String(e?.message) === DOWNLOAD_CANCELLED) setTip(`已取消「${m.name}」的下载，没留下半成品。`);
+      else setErr(e?.message || String(e));
     } finally {
       setBusyId(null);
       setProg(null);
@@ -123,7 +137,8 @@ export default function ModelsScreen() {
       setNasName('');
       await refresh();
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      if (String(e?.message) === DOWNLOAD_CANCELLED) setTip('已取消，没留下半成品。');
+      else setErr(e?.message || String(e));
     } finally {
       setBusyId(null);
       setProg(null);
@@ -151,6 +166,27 @@ export default function ModelsScreen() {
   const doLoad = async (rec: LocalModelRecord) => {
     setErr(null);
     setTip(null);
+    // 内存不够必须在**加载前**拦住，不能等崩：iOS 上超限是被系统直接杀掉、没有报错机会，
+    // 用户看到的现象是「点加载 → App 没了」，根本联想不到内存。这一屏自己的约束①就是这条。
+    if (avail.available && fitForModel(rec.bytes, totalMem) === 'no') {
+      Alert.alert(
+        '这个模型装不进当前机型的内存',
+        `${rec.name} 需要约 ${formatBytes(rec.bytes)}，而本机可用内存装不下它。\n\n继续加载的话，iOS 会直接终止 App（不会有任何报错）。`,
+        [
+          { text: '不加载', style: 'cancel' },
+          {
+            text: '仍要加载',
+            style: 'destructive',
+            onPress: () => void reallyLoad(rec),
+          },
+        ]
+      );
+      return;
+    }
+    await reallyLoad(rec);
+  };
+
+  const reallyLoad = async (rec: LocalModelRecord) => {
     setBusyId(`load:${rec.id}`);
     setLoadNote('准备中…');
     try {
@@ -355,6 +391,18 @@ export default function ModelsScreen() {
                           ? `下载中… ${prog.downloaded ? formatBytes(prog.downloaded) + ' 已落盘' : '等待服务器响应'}`
                           : `下载中 ${Math.round(prog.ratio * 100)}% · ${formatBytes(prog.downloaded)} / ${formatBytes(prog.total)}`}
                       </Text>
+                      {/* 取消：GB 级的下载一旦开始，以前只能等完或杀 App。
+                          选错模型、或发现该走镜像源时，得有退出的办法。 */}
+                      {isDownloading() ? (
+                        <Pressable
+                          style={[s.act, { marginTop: 8, alignSelf: 'flex-start' }]}
+                          onPress={() => {
+                            if (cancelActiveDownload()) setTip('正在取消…');
+                          }}
+                        >
+                          <Text style={s.actT}>取消下载</Text>
+                        </Pressable>
+                      ) : null}
                     </View>
                   ) : null}
 
@@ -421,6 +469,16 @@ export default function ModelsScreen() {
                     ? `拉取中… ${prog.downloaded ? formatBytes(prog.downloaded) + ' 已落盘' : '等待 NAS 响应'}`
                     : `拉取中 ${Math.round(prog.ratio * 100)}%`}
                 </Text>
+                {isDownloading() ? (
+                  <Pressable
+                    style={[s.act, { marginTop: 8, alignSelf: 'flex-start' }]}
+                    onPress={() => {
+                      if (cancelActiveDownload()) setTip('正在取消…');
+                    }}
+                  >
+                    <Text style={s.actT}>取消拉取</Text>
+                  </Pressable>
+                ) : null}
               </View>
             ) : null}
             <Pressable
@@ -551,9 +609,12 @@ export default function ModelsScreen() {
         <View style={s.sysCard}>
           <View style={s.rowBetween}>
             <Text style={s.mName}>{SYSTEM_MODEL.name}</Text>
+            {/* 徽章由真判断得出，不是写死的「本机不可用」：
+                以前那句是常量，而同一屏又承诺「换上支持的机型会自动变可用」——
+                代码里没有任何一处会因换机型而改变，等于界面在说一件不成立的事。 */}
             <View style={s.pill}>
-              <View style={s.dotOff} />
-              <Text style={s.pillT}>本机不可用</Text>
+              <View style={sysStatus.state === 'unsupported' ? s.dotOff : s.dotOn} />
+              <Text style={s.pillT}>{sysStatus.label}</Text>
             </View>
           </View>
           <View style={s.mMetaRow}>
@@ -561,9 +622,7 @@ export default function ModelsScreen() {
             <Text style={s.kv}>零下载</Text>
             <Text style={s.kv}>零占用</Text>
           </View>
-          <Text style={s.note}>
-            由系统提供，质量比 1.5B 这一档好，而且不占存储。要求 {SYSTEM_MODEL.requirement}。换上支持的机型后这一项会自动变为可用，不用改任何设置。
-          </Text>
+          <Text style={s.note}>{sysStatus.detail}</Text>
         </View>
 
         <Text style={s.foot}>

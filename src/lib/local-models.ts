@@ -336,6 +336,75 @@ export const SYSTEM_MODEL = {
   requirement: 'iOS 26 且芯片 A17 Pro 及以上（iPhone 15 Pro / 16 / 17 / 18）',
 };
 
+/** A17 Pro 及以上机型的内存下限（8 GiB）。用它当机型档位的代理量：
+ *  A17 Pro / A18 / A18 Pro 的 iPhone 一律 8GB，而更早的 A16 是 6GB —— 分得开。 */
+const SYSTEM_MODEL_MIN_MEM = 8 * 1024 ** 3;
+/** 系统模型所要求的最低 iOS 大版本 */
+const SYSTEM_MODEL_MIN_IOS = 26;
+
+export type SystemModelState = 'unsupported' | 'pending' | 'not-integrated';
+
+export interface SystemModelStatus {
+  state: SystemModelState;
+  /** 徽章上的短标签 */
+  label: string;
+  /** 卡片里那句解释：说清「为什么现在是这个状态」，以及用户要不要做什么 */
+  detail: string;
+}
+
+/**
+ * 系统内置模型在本机到底能不能用。
+ *
+ * **纯函数**（不 import react-native）：三个判断依据由调用方把真实值传进来，
+ * 这样它能在 Node 里被离线测试兜住 —— 而判断逻辑恰恰是最该被兜住的那类代码。
+ *
+ * 三种状态必须分开，因为用户要做的事完全不同：
+ *   · unsupported      —— 这台机器根本不具备条件（非 iOS / 版本低 / 内存不够），换机器才可能有用
+ *   · pending          —— 条件具备，但还没接入（需要 iOS 26 的原生接口，我们还没写）
+ *   · not-integrated   —— 同 pending 的区分留给将来：真接上之后这里要返回别的状态
+ *
+ * ⚠️ 不要在界面上写死「本机不可用」并承诺「换机型后自动变可用」：那是句空话，
+ * 代码里没有任何一处会因为换了机型而改变显示 —— 承诺了做不到的事比不说更糟。
+ */
+export function systemModelStatus(env: {
+  os?: string;
+  major?: number;
+  memBytes?: number;
+}): SystemModelStatus {
+  const os = String(env.os || '').toLowerCase();
+  const major = Number(env.major) || 0;
+  const mem = Number(env.memBytes) || 0;
+
+  if (os && os !== 'ios') {
+    return {
+      state: 'unsupported',
+      label: '仅 iOS',
+      detail: `系统内置模型由 iOS 提供，当前是 ${os}，用不了这一项。其余来源不受影响。`,
+    };
+  }
+  if (major && major < SYSTEM_MODEL_MIN_IOS) {
+    return {
+      state: 'unsupported',
+      label: `需 iOS ${SYSTEM_MODEL_MIN_IOS}`,
+      detail: `当前系统版本不满足：${SYSTEM_MODEL.requirement}。`,
+    };
+  }
+  if (mem && mem < SYSTEM_MODEL_MIN_MEM) {
+    return {
+      state: 'unsupported',
+      label: '机型不满足',
+      detail: `这台设备的内存档位装不下系统模型：${SYSTEM_MODEL.requirement}。`,
+    };
+  }
+  // 条件具备，但这一项目前还没有真正的调用通路：Apple 的端侧模型要经 iOS 26 的原生
+  // 接口调用，而那部分原生代码还没写。如实说「还没接上」，别装作已经能用。
+  return {
+    state: 'not-integrated',
+    label: '待接入',
+    detail: '这台设备的条件满足，但系统模型要经过 iOS 26 的原生接口才能调用 —— 那部分还没接上，接上后这一项会直接可用（不需要下载任何文件）。',
+  };
+}
+
 // ---------------------------------------------------------------- 已装模型（设备上的实例）
 
 export type ModelSource = 'catalog' | 'nas' | 'file';

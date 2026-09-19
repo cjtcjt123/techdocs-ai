@@ -6,7 +6,9 @@
 // 存放位置：应用沙盒的 document/models/ —— document 目录不会被系统自动清理。
 //
 // web 端由 model-store.web.ts 通过 Metro 平台后缀自动替换。
+import { Platform } from 'react-native';
 import { Directory, File, Paths } from 'expo-file-system';
+import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as DocumentPicker from 'expo-document-picker';
 import { assertOnline } from './net-guard';
 import {
@@ -38,6 +40,35 @@ export interface DownloadProgress {
 }
 
 export type ProgressFn = (p: DownloadProgress) => void;
+
+/** 下载被用户取消时抛的这个标记。界面据此显示「已取消」而不是「下载失败」 */
+export const DOWNLOAD_CANCELLED = 'DOWNLOAD_CANCELLED';
+
+// 当前进行中的下载任务（同一时刻只允许一个：GB 级并发下载在手机上没意义，
+// 而且两个进度回调往同一个 UI 上写会互相打架）。
+let activeTask: { cancel: () => void } | null = null;
+
+export function isDownloading(): boolean {
+  return !!activeTask;
+}
+
+/**
+ * 取消正在进行的下载。返回 false = 此刻没有可取消的下载（按钮本就不该亮）。
+ *
+ * 存在理由：模型是 GB 级的，手机上一旦开始，以前只能等完或杀 App ——
+ * 中途发现选错了模型（或网络换了），用户没有任何退出的办法。
+ */
+export function cancelActiveDownload(): boolean {
+  if (!activeTask) return false;
+  const t = activeTask;
+  activeTask = null;
+  try {
+    t.cancel();
+  } catch {
+    // 取消失败不该抛出：调用方只是想让界面回到可操作状态
+  }
+  return true;
+}
 
 function modelsDir(): Directory {
   const d = new Directory(Paths.document, DIR_NAME);
@@ -157,6 +188,57 @@ async function downloadTo(url: string, fileName: string, totalHint: number, onPr
     );
   }
 
+  onProgress?.({ downloaded: 0, total: totalHint, ratio: totalHint > 0 ? 0 : null });
+
+  // 可取消的下载只走原生端：expo-file-system 的**新**接口（File.downloadFileAsync）
+  // 没有取消能力，能取消的是 legacy 的 DownloadResumable；而 web 上 legacy 没有实现，
+  // 所以 web 继续走「轮询文件大小」那条路（web 本来也下载不了 GB 级模型）。
+  const resumable =
+    Platform.OS !== 'web'
+      ? FileSystemLegacy.createDownloadResumable(url, dest.uri, {}, (d) => {
+          const total = Number(d.totalBytesExpectedToWrite) || totalHint;
+          const done = Number(d.totalBytesWritten) || 0;
+          onProgress?.({ downloaded: done, total, ratio: total > 0 ? Math.min(1, done / total) : null });
+        })
+      : null;
+
+  if (resumable) {
+    activeTask = {
+      cancel: () => {
+        void resumable.cancelAsync();
+        // 半成品要删掉：留着会占几百 MB，而且下次下载同名文件会撞 idempotent
+        try {
+          dest.delete();
+        } catch {
+          /* 删不掉就算了，至少界面上会被列为「无效文件」并提示 */
+        }
+      },
+    };
+    try {
+      const r = await resumable.downloadAsync();
+      // 被取消时 downloadAsync 返回 undefined —— 这不是失败，是用户主动停的
+      if (!r) throw new Error(DOWNLOAD_CANCELLED);
+    } catch (e: any) {
+      if (String(e?.message) === DOWNLOAD_CANCELLED) throw e;
+      throw new Error(
+        `下载失败：${String(e?.message || e)}\n请检查网络（国内直连 HuggingFace 常不通，界面里可切镜像源），或改用「NAS 拉取」。`
+      );
+    } finally {
+      activeTask = null;
+    }
+    // 后面校验文件头的代码两条路共用
+    const info = await readGgufHead(dest);
+    if (!info.ok) {
+      try {
+        dest.delete();
+      } catch {
+        // 删不掉也要把错误抛出去，让用户知道文件是坏的
+      }
+      throw new Error(`下载到的文件不是有效的 GGUF，已删除。${info.error || ''}`);
+    }
+    return dest;
+  }
+
   let poll: ReturnType<typeof setInterval> | null = null;
   const tick = () => {
     try {
@@ -166,7 +248,6 @@ async function downloadTo(url: string, fileName: string, totalHint: number, onPr
       // 文件还没落盘时会抛错，忽略
     }
   };
-  onProgress?.({ downloaded: 0, total: totalHint, ratio: totalHint > 0 ? 0 : null });
   poll = setInterval(tick, 600);
 
   try {
