@@ -156,6 +156,115 @@ export async function testModel(cfg: ModelConfig): Promise<ConnTestResult> {
  */
 export interface ChatOpts {
   signal?: AbortSignal;
+  /**
+   * 流式增量回调：每收到一小段就调一次（含标点，不含 SSE 帧头）。
+   * 传了它才走 SSE 流式；不传 = 整段等完（「需求符合性检查」要解析 JSON，就必须整段）。
+   *
+   * 为什么值得做：等待感不是由「总耗时」决定的，而是由「第一个字什么时候出现」决定的。
+   * 模型一个字一个字往外吐，用户知道它在动；转圈 20 秒再整段弹出，同样的时间却像卡住。
+   */
+  onDelta?: (delta: string) => void;
+}
+
+/** 极简 UTF-8 解码。流式读到的字节块会在任意位置断开，中文（3 字节）被切成两半就变乱码，
+ *  所以先按 `\n` 攒成**整行**再解，这一步能保证行内字节完整。 */
+function utf8Text(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; ) {
+    const b = bytes[i];
+    if (b < 0x80) {
+      out += String.fromCharCode(b);
+      i += 1;
+    } else if (b < 0xe0) {
+      out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i + 1] & 0x3f));
+      i += 2;
+    } else if (b < 0xf0) {
+      out += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f));
+      i += 3;
+    } else {
+      const cp =
+        ((b & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+      const v = cp - 0x10000;
+      out += String.fromCharCode(0xd800 + (v >> 10), 0xdc00 + (v & 0x3ff));
+      i += 4;
+    }
+  }
+  return out;
+}
+
+/** 一行 SSE 里取出本次要显示的文字。OpenAI 兼容与 Claude 的字段不同，各自取各自的 */
+function sseDeltaOf(payload: string): string {
+  const line = payload.trim();
+  if (!line || line === '[DONE]') return '';
+  try {
+    const j = JSON.parse(line);
+    // OpenAI 兼容（含 Ollama / vLLM）：choices[0].delta.content
+    if (j?.choices?.[0]?.delta?.content != null) return String(j.choices[0].delta.content);
+    // Claude：content_block_delta 事件里带 text
+    if (j?.type === 'content_block_delta') return String(j?.delta?.text ?? '');
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 读一条 SSE 流：边读边把增量交给 onDelta，同时把它们攒成完整文本返回。
+ *
+ * 拿不到 `res.body.getReader()` 时（部分 RN 版本 / 网关不支持流式响应）退化成
+ * 「整段取回再按行解析」——那时 onDelta 只会被调一次，效果等同旧的整段等完，
+ * **不会报错、不会丢内容**。降级优先于炫技。
+ */
+async function readSse(res: any, onDelta: (t: string) => void): Promise<string> {
+  const reader = res?.body?.getReader?.();
+  if (!reader) {
+    const txt = await res.text();
+    let all = '';
+    for (const raw of String(txt).split('\n')) {
+      if (!raw.startsWith('data:')) continue;
+      const d = sseDeltaOf(raw.slice(5));
+      if (d) {
+        all += d;
+        onDelta(d);
+      }
+    }
+    return all;
+  }
+  let all = '';
+  let buf = new Uint8Array(0);
+  const push = (chunk: Uint8Array) => {
+    const merged = new Uint8Array(buf.length + chunk.length);
+    merged.set(buf, 0);
+    merged.set(chunk, buf.length);
+    buf = merged;
+    // 只处理**完整行**：留着最后一段（可能是不完整的行）等下一个 chunk
+    let start = 0;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] !== 0x0a) continue;
+      const line = utf8Text(buf.subarray(start, i));
+      start = i + 1;
+      if (!line.startsWith('data:')) continue;
+      const d = sseDeltaOf(line.slice(5));
+      if (d) {
+        all += d;
+        onDelta(d);
+      }
+    }
+    buf = buf.subarray(start);
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) push(value instanceof Uint8Array ? value : new Uint8Array(value));
+  }
+  if (buf.length) {
+    const d = sseDeltaOf(utf8Text(buf));
+    if (d) {
+      all += d;
+      onDelta(d);
+    }
+  }
+  return all;
 }
 
 export async function chat(cfg: ModelConfig, messages: ChatMsg[], opts?: ChatOpts): Promise<string> {
@@ -169,7 +278,9 @@ export async function chat(cfg: ModelConfig, messages: ChatMsg[], opts?: ChatOpt
     if (!loadedModelId()) {
       throw new Error('还没有加载本地模型。请到「我的 → 模型管理」里选一个加载（第一次要先下载）。');
     }
-    return localChat(messages);
+    // 本地模型的 onDelta 本来就实现了（llama.rn 的 token 回调），只是一直没人传 ——
+    // 手机本地推理最慢，恰恰是最需要边出字边看的那一路。
+    return localChat(messages, { onDelta: opts?.onDelta });
   }
   const t = resolveTarget(cfg);
   assertOnline('调用云端模型');
@@ -185,13 +296,39 @@ export async function chat(cfg: ModelConfig, messages: ChatMsg[], opts?: ChatOpt
   if (!allowed) {
     throw new Error('已取消本次云端调用（资料未发出）。不想每次都确认，可到「我的 → 隐私与安全」关掉「云端调用需确认」。');
   }
-  if (t.claude) return chatClaude(t, messages, opts?.signal);
+  if (t.claude) return chatClaude(t, messages, opts);
 
   const url = joinPath(t.baseURL, '/chat/completions');
+  const mkBody = (stream: boolean) =>
+    JSON.stringify({ model: t.model, messages, stream, temperature: 0.2 });
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${t.apiKey}` };
+
+  if (opts?.onDelta) {
+    const res = await fetch(url, { method: 'POST', headers, body: mkBody(true), signal: opts?.signal });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`API 错误 ${res.status} @ ${url}：${txt.slice(0, 300)}`);
+    }
+    const text = await readSse(res, opts.onDelta);
+    // 有些网关嘴上收了 stream:true、实际仍整段返回 —— 那时一个增量都不会有。
+    // 补一次非流式请求，宁可慢一点也不能给用户一个空回答。
+    if (text) return text;
+    const again = await fetch(url, { method: 'POST', headers, body: mkBody(false), signal: opts?.signal });
+    if (!again.ok) {
+      const txt = await again.text().catch(() => '');
+      throw new Error(`API 错误 ${again.status} @ ${url}：${txt.slice(0, 300)}`);
+    }
+    const data = await again.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content) throw new Error('API 返回为空');
+    opts.onDelta(content);
+    return content;
+  }
+
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t.apiKey}` },
-    body: JSON.stringify({ model: t.model, messages, stream: false, temperature: 0.2 }),
+    headers,
+    body: mkBody(false),
     signal: opts?.signal,
   });
   if (!res.ok) {
@@ -204,17 +341,31 @@ export async function chat(cfg: ModelConfig, messages: ChatMsg[], opts?: ChatOpt
   return content;
 }
 
-async function chatClaude(t: Resolved, messages: ChatMsg[], signal?: AbortSignal): Promise<string> {
+async function chatClaude(t: Resolved, messages: ChatMsg[], opts?: ChatOpts): Promise<string> {
   const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
   const msgs = messages
     .filter((m) => m.role !== 'system')
     .map((m) => ({ role: m.role, content: m.content }));
   const url = joinPath(t.baseURL, '/messages');
+  const headers = { 'Content-Type': 'application/json', 'x-api-key': t.apiKey, 'anthropic-version': '2023-06-01' };
+  const mkBody = (stream: boolean) =>
+    JSON.stringify({ model: t.model, system, messages: msgs, max_tokens: 2000, stream });
+
+  if (opts?.onDelta) {
+    const res = await fetch(url, { method: 'POST', headers, body: mkBody(true), signal: opts.signal });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`Claude 错误 ${res.status} @ ${url}：${txt.slice(0, 200)}`);
+    }
+    const text = await readSse(res, opts.onDelta);
+    if (text) return text;
+  }
+
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': t.apiKey, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: t.model, system, messages: msgs, max_tokens: 2000 }),
-    signal,
+    headers,
+    body: mkBody(false),
+    signal: opts?.signal,
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');

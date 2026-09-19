@@ -1,5 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, TextInput, ScrollView, StyleSheet, Pressable, Alert, KeyboardAvoidingView, Platform, Share } from 'react-native';
+import {
+  View, Text, TextInput, ScrollView, StyleSheet, Pressable, Alert,
+  KeyboardAvoidingView, Platform, Share, FlatList,
+} from 'react-native';
 import { colors, mono, radius, shadow, space } from '../theme';
 import Button from '../components/Button';
 import SourceCard from '../components/SourceCard';
@@ -73,6 +76,10 @@ export default function ChatScreen() {
   const [recordFor, setRecordFor] = useState<CasePrefill | null>(null);
   const [toast, setToast] = useState('');
   const scrollRef = useRef<ScrollView>(null);
+  const listRef = useRef<FlatList<Message>>(null);
+  // 用户是不是正贴在底部。只有贴底时才自动跟随 —— 否则他往上翻历史看一段长回答，
+  // 每来一个新字就把视图拽回底部，等于让人没法读。
+  const atBottom = useRef(true);
 
   const retrieval = settings.retrieval ?? { topK: 8, onlyPinned: false, tags: [] };
   const pinnedDocs = documents.filter((d) => d.pinned);
@@ -124,7 +131,7 @@ export default function ChatScreen() {
   const convTitle = titleOf(conv);
 
   useEffect(() => {
-    scrollRef.current?.scrollToEnd({ animated: true });
+    if (atBottom.current) listRef.current?.scrollToEnd({ animated: true });
   }, [messages.length, thinking]);
 
   const addAttachments = async () => {
@@ -386,8 +393,9 @@ export default function ChatScreen() {
         />
       ) : null}
 
-      <ScrollView ref={scrollRef} style={styles.list} contentContainerStyle={styles.listInner}>
-        {messages.length === 0 && (
+      {messages.length === 0 ? (
+        // 空态不值得虚拟化：就一屏欢迎卡，用 FlatList 反而多一层抽象。
+        <ScrollView ref={scrollRef} style={styles.list} contentContainerStyle={styles.listInner}>
           <View style={styles.welcome}>
             {/* 状态卡从「工作台」整屏搬过来 —— 那一屏取消了，但这三个数字是每次进 App 都想瞟一眼的，
                 丢掉可惜。放在空态里恰好：有消息时它自然让位给对话。 */}
@@ -421,18 +429,50 @@ export default function ChatScreen() {
               ))}
             </View>
           </View>
-        )}
-        {messages.map((m, i) => (
-          <Bubble
-            key={m.id}
-            m={m}
-            // 报错气泡不给记录入口：没解决问题时能记的只有「未解决」，
-            // 而失败记录的价值在于「换条件再试」，不是把一次网络错误记成案例
-            onRecord={m.role === 'ai' && !m.content.startsWith('⚠️') ? () => openRecord(i) : undefined}
-          />
-        ))}
-        {thinking && <View style={[styles.bubble, { alignSelf: 'flex-start', backgroundColor: colors.primarySoft }]}><Text style={{ color: colors.text }}>思考中…</Text></View>}
-      </ScrollView>
+        </ScrollView>
+      ) : (
+        // 对话用 FlatList：长会话几百条时，ScrollView 会把每一条都实例化并留在内存里，
+        // 滚到哪儿都越来越卡。虚拟化后只渲染视口附近的若干条。
+        <FlatList
+          ref={listRef}
+          data={messages}
+          keyExtractor={(m) => m.id}
+          renderItem={({ item, index }) => (
+            <Bubble
+              m={item}
+              // 报错气泡不给记录入口：没解决问题时能记的只有「未解决」，
+              // 而失败记录的价值在于「换条件再试」，不是把一次网络错误记成案例
+              onRecord={item.role === 'ai' && !item.content.startsWith('⚠️') ? () => openRecord(index) : undefined}
+            />
+          )}
+          ListFooterComponent={
+            thinking ? (
+              <View style={[styles.bubble, { alignSelf: 'flex-start', backgroundColor: colors.primarySoft }]}>
+                <Text style={{ color: colors.text }}>思考中…</Text>
+              </View>
+            ) : null
+          }
+          style={styles.list}
+          contentContainerStyle={styles.listInner}
+          // 只渲染视口上下各 4 屏，其余回收。removeClippedSubviews 在 iOS 上把滑出视口的
+          // 视图层级摘掉 —— 长列表掉帧主要就掉在这上面。
+          windowSize={9}
+          maxToRenderPerBatch={8}
+          initialNumToRender={12}
+          removeClippedSubviews
+          onScroll={({ nativeEvent }) => {
+            const { layoutMeasurement, contentOffset, contentSize } = nativeEvent;
+            atBottom.current =
+              contentSize.height - (contentOffset.y + layoutMeasurement.height) < 80;
+          }}
+          scrollEventThrottle={100}
+          // 流式出字会让最后一条不断变高。只有用户本来就在底部时才跟着往下走 ——
+          // 他在翻历史时把视图拽回底部，等于不让人读。
+          onContentSizeChange={() => {
+            if (atBottom.current) listRef.current?.scrollToEnd({ animated: false });
+          }}
+        />
+      )}
 
       {attachments.length > 0 && (
         <View style={styles.attStrip}>
@@ -707,7 +747,9 @@ const styles = StyleSheet.create({
   attChipText: { fontSize: 12, color: colors.primary, maxWidth: 150 },
   attChipX: { fontSize: 12, color: colors.primary, marginLeft: 6, fontWeight: '700' },
   inputBar: {
-    flexDirection: 'row', alignItems: 'flex-end', padding: space.s2, paddingBottom: space.s2 + (Platform.OS === 'ios' ? 0 : 0),
+    // 原来是 `space.s2 + (Platform.OS === 'ios' ? 0 : 0)` —— 三元两边都是 0，等价于没写，
+    // 但它会让人以为「这里针对平台做了什么」，下次改这块的人得先判断那个三元是不是有意义的。
+    flexDirection: 'row', alignItems: 'flex-end', padding: space.s2,
     borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.surface, gap: space.s1,
   },
   // 核对模式下给输入栏描一圈主色边：切了模式而输入框毫无变化的话，人不会意识到模式变了
