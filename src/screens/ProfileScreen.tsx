@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, ScrollView, StyleSheet, Switch, Pressable, TextInput } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { View, Text, ScrollView, StyleSheet, Switch, Pressable, TextInput, Alert } from 'react-native';
 import { colors, mono, radius, shadow, space } from '../theme';
 import Button from '../components/Button';
 import { useStore } from '../store';
@@ -61,6 +61,15 @@ export default function ProfileScreen() {
   // 草稿态：所有改动先落在 draft，点「保存」才落盘 + 提示成功
   const [draft, setDraft] = useState<AppSettings>(settings);
   const [saved, setSaved] = useState(false);
+  // 「已保存」提示的定时器必须在卸载时清掉：用户在 2 秒内切走 Tab，
+  // 定时器仍会 setState —— RN 会告警，且这是唯一一处能稳定复现的卸载后 setState。
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+    },
+    []
+  );
   const mc = draft.modelConfig;
 
   // 「服务与后端」默认收起：NAS / 解析 / 嵌入这三个地址配一次基本不再动，
@@ -121,6 +130,44 @@ export default function ProfileScreen() {
     void refreshEmbeddingStats();
   }, [refreshEmbeddingStats]);
 
+  // ---- 未保存改动的判定 ----
+  // 比的是「上次保存/进页面时的快照」，不是拿 draft 跟 settings 比：
+  // settings 会被规范化（补默认值、清掉失效的分类引用），保存完两边 JSON 仍可能不等，
+  // 那样用户刚点完保存就又被告知「有未保存改动」—— 这个提示一旦不可信就等于没有。
+  const snapshot = () =>
+    JSON.stringify({ draft, nasForm, nasPw, psEndpoint, psToken, emEndpoint, emToken, emModel });
+  const [base, setBase] = useState('');
+  const dirty = base !== '' && snapshot() !== base;
+  // 首帧之后才确立基线：早一帧的话，useState 初始值刚从 settings 读完就被判成「改动过」
+  useEffect(() => {
+    if (base === '') setBase(snapshot());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+
+  // 切走 Tab 时提醒：这一页的改动只在点「保存」后才生效，
+  // 以前是「填了一屏、切走、静默丢失」—— 而填的东西（地址、密钥）重填一遍很烦。
+  useEffect(() => {
+    const unsub = navigation.addListener('blur', () => {
+      if (!dirtyRef.current) return;
+      Alert.alert(
+        '有改动还没保存',
+        '这一页的改动要点右上角「保存」才会生效。切走的话，刚才填的内容不会保留。',
+        [
+          // 「放弃」只关掉弹窗：人已经切走了，改动留在这一页里，回来还能接着保存
+          { text: '知道了', style: 'default' },
+          {
+            text: '回去保存',
+            style: 'cancel',
+            onPress: () => navigation.navigate('Profile' as never),
+          },
+        ]
+      );
+    });
+    return unsub;
+  }, [navigation]);
+
   const onTestEmbed = async () => {
     const ep = emEndpoint.trim();
     if (!ep) { setEmTest({ ok: false, msg: '请先填写嵌入服务地址' }); return; }
@@ -144,10 +191,14 @@ export default function ProfileScreen() {
     setPsTesting(false);
   };
 
-  // 折叠头右边那行摘要：不展开也知道三个服务各自配成什么样了
+  // 折叠头右边那行摘要：不展开也知道三个服务各自配成什么样了。
+  // ⚠️ 三个都读**当前正在编辑的值**（nasForm / psEndpoint / emEndpoint），不能读 settings：
+  // settings 是上一次保存的结果，填了地址还没保存时它仍是「未配」——
+  // 折叠头就会当着用户的面说一句已经不成立的话（「解析 未配」）。
   const servicesSummary = [
     draft.dataStrategy === 'local' ? null : nasForm?.host ? 'NAS ✓' : 'NAS 未配',
-    settings.parseService?.endpoint ? '解析 ✓' : '解析 未配',
+    psEndpoint.trim() ? '解析 ✓' : '解析 未配',
+    emEndpoint.trim() ? '嵌入 ✓' : '嵌入 未配',
     embeddingTotal ? `索引 ${embeddingCount}/${embeddingTotal}` : '索引 未建',
   ].filter(Boolean).join(' · ');
 
@@ -202,8 +253,11 @@ export default function ProfileScreen() {
     } else {
       await updateSettings({ nas: undefined });
     }
+    // 基线前移：保存完就不该再有「未保存」提示。放在这些 await 之后 ——
+    // 保存失败时（updateSettings 抛错）基线不动，用户切走仍会被提醒，这是对的。
+    setBase(snapshot());
     setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    savedTimer.current = setTimeout(() => setSaved(false), 2000);
   };
 
   return (
@@ -213,7 +267,8 @@ export default function ProfileScreen() {
       <View style={styles.hd}>
         <Text style={styles.hdTitle}>我的</Text>
         <Pressable style={styles.saveTop} onPress={onSave}>
-          <Text style={styles.saveTopT}>保存</Text>
+          {/* 有改动时按钮上带个点：不点开任何弹窗也知道「当前有东西没落盘」 */}
+          <Text style={styles.saveTopT}>保存{dirty ? ' ●' : ''}</Text>
         </Pressable>
       </View>
       <ScrollView contentContainerStyle={styles.container}>

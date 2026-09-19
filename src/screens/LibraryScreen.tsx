@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, Pressable, TextInput,
 } from 'react-native';
@@ -61,7 +61,7 @@ export default function LibraryScreen() {
   // 拖着这一屏（以及它那份可能很长的文档列表）一起重渲染。
   const {
     documents, importFiles, importing, removeDoc, renameDoc,
-    settings, nasFiles, nasScanning, browseNas, openNasDoc, nasCurrent,
+    settings, nasFiles, nasScanning, browseNas, openNasDoc, nasCurrent, nasPath,
     attachNasToChat, closeNasDoc, syncFromNas, lastError,
     togglePin, updateDocTags, runSearch, clearSearch,
     batchRemoveDocs, batchAddTags,
@@ -82,6 +82,7 @@ export default function LibraryScreen() {
       browseNas: s.browseNas,
       openNasDoc: s.openNasDoc,
       nasCurrent: s.nasCurrent,
+      nasPath: s.nasPath,
       attachNasToChat: s.attachNasToChat,
       closeNasDoc: s.closeNasDoc,
       syncFromNas: s.syncFromNas,
@@ -130,6 +131,13 @@ export default function LibraryScreen() {
   // 单个删除也要先确认：这是不可逆操作，误触的代价是整份资料要重新导入+解析。
   const [delTarget, setDelTarget] = useState<Document | null>(null);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 防抖定时器必须在卸载时清掉：输完字立刻切 Tab，220ms 后仍会跑一次全库扫描并 setState。
+  useEffect(
+    () => () => {
+      if (searchTimer.current) clearTimeout(searchTimer.current);
+    },
+    []
+  );
 
   // ---- 批量选择 ----
   // 只允许「进选择态后逐项勾选」，不提供任何形式的「一键全清空」：
@@ -418,7 +426,9 @@ export default function LibraryScreen() {
         <View style={styles.headLeft}>
           <Text style={styles.title}>{tab === 'cases' ? '经验库' : '资料库'}</Text>
           <Text style={styles.sub}>
-            {tab === 'cases' ? '' : selectMode ? `已选 ${selected.length}` : subText}
+            {/* 经验库 Tab 也不能留空 —— 顶栏空一块看着像没渲染出来，
+                而且份数本身就是这一屏最该先看的信息（记了多少条经验）。 */}
+            {tab === 'cases' ? `${cases.length} 条经验` : selectMode ? `已选 ${selected.length}` : subText}
           </Text>
         </View>
         {canSelect && tab === 'docs' && (
@@ -507,16 +517,32 @@ export default function LibraryScreen() {
                   <Text style={styles.emptyHint}>点下方「浏览 NAS」拉取文件列表；点文件即从 NAS 读取（需联网，不占手机空间）。</Text>
                 </View>
               )}
+              {/* 面包屑 + 返回上级：进了子目录必须知道自己在哪、能退回去。
+                  只要不在根目录就显示 —— 根目录显示「NAS /」纯属占地方。 */}
+              {nasPath !== '' && (
+                <View style={styles.nasPathRow}>
+                  <Pressable hitSlop={6} onPress={() => void browseNas()} style={styles.nasUp}>
+                    <Text style={styles.nasUpT}>← 返回上级</Text>
+                  </Pressable>
+                  <Text style={styles.nasPathText} numberOfLines={1}>
+                    NAS / {nasPath.split('/').filter(Boolean).join(' / ')}
+                  </Text>
+                </View>
+              )}
               {nasFiles.map((f) => (
                 <Pressable
                   key={f.href}
-                  onPress={() => { if (!f.isDir) openNasDoc(f); }}
+                  // 文件夹要能进：以前点它直接 return，看着像点了没反应（列表里画着 📁，
+                  // 用户自然会以为能点开）。现在进一层；文件才是打开阅读。
+                  onPress={() => (f.isDir ? void browseNas(f.name) : void openNasDoc(f))}
+                  disabled={nasScanning}
                   style={({ pressed }) => [styles.card, pressed && { opacity: 0.7 }]}
                 >
                   <View style={{ flex: 1 }}>
                     <Text style={styles.docName} numberOfLines={1}>{f.isDir ? '📁 ' : '📄 '}{f.name}</Text>
-                    <Text style={styles.docMeta}>{f.isDir ? '文件夹' : `NAS · ${formatSize(f.size)}`}</Text>
+                    <Text style={styles.docMeta}>{f.isDir ? '文件夹 · 点开进入' : `NAS · ${formatSize(f.size)}`}</Text>
                   </View>
+                  {f.isDir ? <Text style={styles.nasChevron}>›</Text> : null}
                 </Pressable>
               ))}
             </>
@@ -1190,6 +1216,18 @@ const styles = StyleSheet.create({
   empty: { paddingVertical: space.s4, alignItems: 'center' },
   emptyText: { fontSize: 14, color: colors.text, marginBottom: 6 },
   emptyHint: { fontSize: 12, color: colors.muted, textAlign: 'center', paddingHorizontal: space.s4, lineHeight: 19 },
+  // NAS 面包屑行：进了子目录后要知道自己在哪、怎么退回去
+  nasPathRow: {
+    flexDirection: 'row', alignItems: 'center', gap: space.s2,
+    marginBottom: space.s2, paddingHorizontal: 2,
+  },
+  nasUp: {
+    borderWidth: 1, borderColor: colors.border, borderRadius: radius.md,
+    paddingHorizontal: 9, paddingVertical: 5, backgroundColor: colors.card,
+  },
+  nasUpT: { fontSize: 11.5, color: colors.text, fontFamily: mono },
+  nasPathText: { flex: 1, fontFamily: mono, fontSize: 10.5, color: colors.muted },
+  nasChevron: { fontSize: 20, color: colors.faint, paddingHorizontal: 2 },
   card: {
     backgroundColor: colors.card, borderRadius: radius.xl,
     paddingHorizontal: space.s2 + 2, paddingVertical: space.s2, marginBottom: space.s1 + 2,

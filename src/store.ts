@@ -13,7 +13,7 @@ import {
   initDB, getDocuments, insertDocument, insertChunks, updateDocStatus,
   deleteDocument, renameDocument, kvGet, kvSet,
   setDocumentPinned, setDocumentTags,
-  getAllChunksForIndex, putEmbeddings, clearEmbeddings, embeddingStats,
+  getAllChunksForIndex, putEmbeddings, clearEmbeddings, embeddingStats, countChunks,
   listCases, saveCase as saveCaseRow, deleteCase as deleteCaseRow,
   getChunks,
 } from './lib/storage';
@@ -85,6 +85,48 @@ function cleanTags(tags: string[]): string[] {
 }
 
 /**
+ * 限流并发：同时最多跑 `limit` 个，**返回顺序与入参一致**。
+ *
+ * 为什么要这个而不是 `Promise.all`：
+ * 电话上同时解析 20 份 PDF 会把内存打满（每份都要解码、配了解析服务时还有一次网络往返），
+ * 而串行 await 又让 10 份文件 = 10 倍耗时。2~3 路是实测下来既明显快、又不至于把机器压住的档。
+ *
+ * 保序是硬要求：入库顺序决定了「同一批里两份内容相同的资料留下哪一份」，
+ * 顺序不定会让判重结果不可预测（今天留 A、明天留 B）。
+ */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let cursor = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  // 路数取 min(limit, 份数)：1 份文件也开 3 个 worker 没意义，还会占着事件循环
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return out;
+}
+
+/** 导入 / NAS 同步时同时解析的份数。解析是耗时大头，也是唯一值得并发的阶段 */
+const PARSE_CONCURRENCY = 3;
+
+/**
+ * NAS 子路径拼接。只做「当前层 + 下一层」这一件事，且不吃 `..` / 绝对路径 ——
+ * 目录名来自服务端返回的 PROPFIND 列表，理论上可信，但拼进 URL 前仍做一次扁平化，
+ * 免得一个带 `/` 或 `../` 的名字把请求指到别处去。
+ */
+function joinNasPath(current: string, name: string): string {
+  const seg = String(name || '').replace(/^\/+|\/+$/g, '').split('/').filter((p) => p && p !== '.' && p !== '..');
+  const base = String(current || '')
+    .replace(/^\/+|\/+$/g, '')
+    .split('/')
+    .filter(Boolean);
+  return [...base, ...seg].join('/');
+}
+
+/**
  * 新导入的资料默认归入哪个分类。
  *
  * ⚠️ 必须校验「这个分类还在分类表里」：用户可能删了分类却没同步改默认值，
@@ -120,9 +162,17 @@ function beginGeneration(timeoutMs = GEN_TIMEOUT_MS) {
   };
 }
 
-// 「云端调用需确认」弹窗的挂起回调。放在模块级而不是 state 里：
-// 它是个函数、不参与渲染，放进 state 只会让每次 set 都触发一次无意义的重渲染。
-let confirmResolver: ((ok: boolean) => void) | null = null;
+/**
+ * 「云端调用需确认」的待回答请求。放在模块级而不是 state 里：
+ * 它是个函数、不参与渲染，放进 state 只会让每次 set 都触发一次无意义的重渲染。
+ *
+ * ⚠️ 必须是**队列**而不是单个变量：问答会并发发请求（检索嵌入一路、对话一路，
+ * 或连续两次调用），用单个变量存 resolver 时，第二个请求会把第一个的 resolve 覆盖掉 ——
+ * 第一个 Promise 永远没人回答，那一路的 await 就永久挂起，界面表现为「卡在思考中」。
+ * 队列 = 一次只弹一个、回答完接着弹下一个，谁都不会被漏掉。
+ */
+type PendingConfirmReq = { what: string; resolve: (ok: boolean) => void };
+const confirmQueue: PendingConfirmReq[] = [];
 
 // 内部 Message.role 用 'user' | 'ai'，但 OpenAI 兼容接口只认 'assistant'。
 // 必须显式转换：用 `as` 断言只改类型、不改运行时值，会直接把 'ai' 发出去导致 400。
@@ -202,6 +252,8 @@ interface State {
   nasFiles: NasEntry[];
   nasCurrent: { name: string; text: string } | null;
   nasScanning: boolean;
+  /** 当前浏览到的 NAS 子目录（相对根，'' = 根）。点了文件夹才有值 —— 用于「返回上级」和面包屑 */
+  nasPath: string;
   pendingNasAttachment: Attachment | null;
   importing: boolean;
   thinking: boolean;
@@ -269,7 +321,14 @@ interface State {
   updateSettings: (patch: Partial<AppSettings>) => Promise<void>;
   saveNas: (conn: NasConnection, password: string) => Promise<void>;
   syncFromNas: () => Promise<void>;
-  browseNas: () => Promise<void>;
+  /**
+   * 浏览 NAS 目录。
+   *   · 不传参 = 回到根（重新拉一次）
+   *   · 传子目录名 = 在当前目录下进一层（路径由 store 自己拼，调用方只给名字）
+   * 「点文件夹没反应」是个坏体验：列表里明明画了 📁，点了却像点了空白处 ——
+   * 因为旧实现只认文件。现在目录可进入，并保留 nasPath 供「返回上级」。
+   */
+  browseNas: (subPath?: string) => Promise<void>;
   openNasDoc: (entry: NasEntry) => Promise<void>;
   attachNasToChat: () => void;
   clearPendingNas: () => void;
@@ -355,6 +414,7 @@ export const useStore = create<State>((set, get) => ({
   nasFiles: [],
   nasCurrent: null,
   nasScanning: false,
+  nasPath: '',
   pendingNasAttachment: null,
   importing: false,
   thinking: false,
@@ -377,8 +437,9 @@ export const useStore = create<State>((set, get) => ({
     // 必须在任何请求可能发生【之前】挂好 —— 否则「启动后第一次问答」会绕过确认弹窗，
     // 而这类漏网只在特定启动顺序下出现，极难复现。
     setConfirmHook((what) => new Promise<boolean>((resolve) => {
-      confirmResolver = resolve;
-      set({ pendingConfirm: { what } });
+      confirmQueue.push({ what, resolve });
+      // 只有自己是队首时才弹 —— 已经在弹第二个时，排在后面等着，别把前一条顶掉
+      if (confirmQueue.length === 1) set({ pendingConfirm: { what } });
     }));
     await initDB();
     const [docs, settings, pc, nasPw, convRaw] = await Promise.all([
@@ -490,10 +551,20 @@ export const useStore = create<State>((set, get) => ({
       // 已入库的正文指纹。动态往里加 —— 本次选中的几份里如果彼此相同，也该只留一份。
       // 没解析出文本的不参与判重（它本来也进不了索引，留着是让用户看见「这份没解析成功」）。
       const seen = new Set(get().documents.map((d) => d.meta?.hash).filter(Boolean) as string[]);
-      for (const a of res.assets) {
+      // 解析并发、入库串行：解析是大头（解码 + 可能一次 NAS 往返），并发能省掉大部分等待；
+      // 但判重依赖「先到的先占住指纹」，所以入库这一段必须按原顺序一条条来。
+      const parsed = await mapLimit(res.assets, PARSE_CONCURRENCY, async (a) => {
+        try {
+          return { a, out: await parseAsset(a, ctx), err: null as string | null };
+        } catch (e: any) {
+          // 单份解析失败不该让整批导入失败 —— 其余文件照常入库，失败的那份进 failed 列表
+          return { a, out: null, err: (e?.message || '解析失败') as string | null };
+        }
+      });
+      for (const { a, out, err } of parsed) {
+        if (!out) { failed.push(`${a.name}：${err || '解析失败'}`); continue; }
         const type = extToType(a.name);
         // 先解析再入库：meta 一次写全，省掉一次补更新
-        const out = await parseAsset(a, ctx);
         const hash = out.text ? contentHash(out.text) : '';
         if (hash && seen.has(hash)) { skipped++; continue; }
         if (hash) seen.add(hash);
@@ -806,13 +877,15 @@ export const useStore = create<State>((set, get) => ({
   newConversation() {
     const conv: Conversation = { id: uid(), messages: [] };
     const next = [conv, ...get().conversations];
-    set({ conversations: next, currentConvId: conv.id });
+    // lastRetrieval 是「上一次检索的痕迹」，属于那一条问答，不属于整个 App：
+    // 不清掉的话，新会话里顶部会挂着上一个会话的检索步骤条，看着像刚发生过。
+    set({ conversations: next, currentConvId: conv.id, lastRetrieval: null });
     void persistConversations(next);
   },
 
   switchConversation(id) {
     if (!get().conversations.some((c) => c.id === id)) return;
-    set({ currentConvId: id });
+    set({ currentConvId: id, lastRetrieval: null });
   },
 
   // 删除会话（UI 侧有二次确认）。若删的是当前会话，自动切到最新一个；全删光则留空由界面新建。
@@ -838,6 +911,9 @@ export const useStore = create<State>((set, get) => ({
     // 生成中拒绝新提问：连发两条的话，两个回答按返回先后追加，
     // 先问的那个可能反而排在后面 —— 界面上看到的就是「答非所问」。
     if (get().thinking) return;
+    // 流式占位消息的 id。放在 try 外面：出错时要把「已挂上去的空消息」就地改成错误提示，
+    // 而不是再追加一条 —— 否则界面上会留下一条永远空白的气泡。
+    let aiId: string | null = null;
     let convId = get().currentConvId;
     if (!convId) { get().newConversation(); convId = get().currentConvId!; }
     const conv = get().conversations.find((c) => c.id === convId)!;
@@ -847,8 +923,11 @@ export const useStore = create<State>((set, get) => ({
 
     const gen = beginGeneration();
     try {
-      const hits = await retrieve(text || '', resolveScope(get()));
-      set({ lastRetrieval: summarizeHits(hits, get().embeddingTotal) });
+      const scope = resolveScope(get());
+      const hits = await retrieve(text || '', scope);
+      // 块数按**本次范围**现算，不用 embeddingTotal：后者只在 init / 进「我的」页时刷新
+      // （导入新文档后就是个陈旧数字），而且限定「仅钉住 / 某分类」时它报的还是全库块数。
+      set({ lastRetrieval: summarizeHits(hits, await countChunks(scope.docIds)) });
       const ctx = buildContext(hits);
       const attText = (attachments || []).filter((a) => a.text).length
         ? '【本次附件文本】\n' + (attachments || []).filter((a) => a.text).map((a) => `《${a.name}》\n${a.text}`).join('\n\n')
@@ -876,12 +955,54 @@ export const useStore = create<State>((set, get) => ({
         ...history.slice(0, -1), // 去掉刚加的 user（已放最后）
         { role: 'user', content: text && text.trim() ? text : '（见本次附件）' },
       ];
-      const aiText = await chat(get().settings.modelConfig, messages, { signal: gen.signal });
-      const aiMsg: Message = { id: uid(), role: 'ai', content: aiText, quotes: hitsToQuotes(hits) };
+      // ---- 流式：先把一条空的 AI 消息挂上去，之后每来一段就往里追加 ----
+      // 等整段返回再一次性塞进去的话，用户看到的是「转圈 20 秒 → 整段弹出」；
+      // 边出字边看，同样的耗时却像一直在动。首个字的出现时间才是等待感的来源。
+      aiId = uid();
+      const patchAi = (patch: Partial<Message>) => {
+        set({
+          conversations: get().conversations.map((c) =>
+            c.id === convId
+              ? { ...c, messages: c.messages.map((m) => (m.id === aiId ? { ...m, ...patch } : m)) }
+              : c
+          ),
+        });
+      };
+      const appendAi = (() => {
+        let buf = '';
+        // 节流：本地模型是逐 token 回调的（每秒几十次），每个 token 都 set 一次会把
+        // 整棵界面树按每秒几十次的频率重渲。攒 100ms 再刷，肉眼看仍是「边出字」。
+        const FLUSH_MS = 100;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let total = '';
+        const flush = () => {
+          timer = null;
+          if (!buf) return;
+          total += buf;
+          buf = '';
+          patchAi({ content: total });
+        };
+        return (d: string) => {
+          buf += d;
+          if (!timer) timer = setTimeout(flush, FLUSH_MS);
+        };
+      })();
       set({
-        conversations: get().conversations.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, aiMsg] } : c)),
-        thinking: false,
+        conversations: get().conversations.map((c) =>
+          c.id === convId
+            ? { ...c, messages: [...c.messages, { id: aiId, role: 'ai', content: '', quotes: hitsToQuotes(hits) }] }
+            : c
+        ),
       });
+
+      const aiText = await chat(get().settings.modelConfig, messages, {
+        signal: gen.signal,
+        onDelta: appendAi,
+      });
+      // 用最终完整文本收尾：流式拼出来的内容可能与服务端返回体有细微差别（重复增量、降级路径），
+      // 以返回值为准更稳；quotes 也在这里一次性带上。
+      patchAi({ content: aiText, quotes: hitsToQuotes(hits) });
+      set({ thinking: false });
       void persistConversations(get().conversations);
     } catch (e: any) {
       // 三种结束方式要给人看三句不同的话。都塞进「请求失败」的话，
@@ -891,9 +1012,14 @@ export const useStore = create<State>((set, get) => ({
         : genTimedOut
           ? `⚠️ 生成超时（超过 ${GEN_TIMEOUT_MS / 1000} 秒还没返回）。可能是网络不通，或模型还在加载 —— 换个网络，或到「我的」里检查一下模型配置。`
           : `⚠️ ${e?.message || '请求失败'}`;
-      const errMsg: Message = { id: uid(), role: 'ai', content, quotes: [] };
+      const errMsg: Message = { id: aiId || uid(), role: 'ai', content, quotes: [] };
       set({
-        conversations: get().conversations.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, errMsg] } : c)),
+        conversations: get().conversations.map((c) =>
+          c.id === convId
+            ? // 已经挂上占位（流式开始之后才失败）→ 就地改内容；否则才追加一条
+              { ...c, messages: aiId && c.messages.some((m) => m.id === aiId) ? c.messages.map((m) => (m.id === aiId ? errMsg : m)) : [...c.messages, errMsg] }
+            : c
+        ),
         thinking: false,
         lastError: genStopped ? null : (genTimedOut ? content : e?.message || '请求失败'),
       });
@@ -917,7 +1043,7 @@ export const useStore = create<State>((set, get) => ({
       // （这个下限原本是「对比」页那条通路单独设的，两路合并后统一到这里）
       const scope = resolveScope(get());
       const hits = await retrieve(text || '', { ...scope, topK: Math.max(scope.topK, 12) });
-      set({ lastRetrieval: summarizeHits(hits, get().embeddingTotal) });
+      set({ lastRetrieval: summarizeHits(hits, await countChunks(scope.docIds)) });
       const ctx = buildContext(hits);
       const attText = (attachments || []).filter((a) => a.text).length
         ? '【用户附件】\n' + (attachments || []).filter((a) => a.text).map((a) => `《${a.name}》\n${a.text}`).join('\n\n')
@@ -987,10 +1113,13 @@ export const useStore = create<State>((set, get) => ({
 
   /** 用户在「云端调用需确认」弹窗上做了选择 */
   answerConfirm(ok) {
-    const r = confirmResolver;
-    confirmResolver = null;
-    set({ pendingConfirm: null });
-    r?.(ok);
+    const cur = confirmQueue.shift();
+    // 先回答再弹下一个：`resolve` 会让等待中的那一路继续往下走，
+    // 它可能又触发一次新的确认请求 —— 顺序反了会把刚入队的那条立刻顶掉。
+    cur?.resolve(ok);
+    // 队首进界面：后面还排着就接着弹下一个，空了才收起弹窗
+    const head = confirmQueue[0];
+    set({ pendingConfirm: head ? { what: head.what } : null });
   },
 
   // 保存 NAS 连接（密码单独落 secure 层）
@@ -1018,29 +1147,33 @@ export const useStore = create<State>((set, get) => ({
       const seen = new Set(get().documents.map((d) => d.meta?.hash).filter(Boolean) as string[]);
       // 同 importFiles：默认归入取一次，且必须还在分类表里
       const defCat = defaultCategoryOf(get().settings);
-      for (const f of files) {
+      // 下载并发、入库串行：同 importFiles 的道理 —— 网络往返是大头，判重必须保序。
+      const pulled = await mapLimit(files, PARSE_CONCURRENCY, async (f) => {
         try {
-          const text = await downloadText(conn, pw, f.href);
-          if (!text) continue;
-          const hash = contentHash(text);
-          if (seen.has(hash)) { skipped++; continue; }
-          seen.add(hash);
-          const type = extToType(f.name);
-          const cls = classifyDoc(f.name, text);
-          const doc: Document = {
-            id: uid(), name: f.name, type, folderId: null, tags: ['NAS'],
-            status: 'indexing',
-            meta: { size: f.size, source: 'nas', hash, model: cls.model, kind: cls.kind, category: defCat },
-            createdAt: new Date().toISOString(),
-          };
-          await insertDocument(doc);
-          const chunks = chunkText(text).map((c) => ({ ...c, docId: doc.id }));
-          await insertChunks(chunks);
-          await updateDocStatus(doc.id, 'indexed');
-          added++;
+          return { f, text: await downloadText(conn, pw, f.href) };
         } catch {
           // 单个文件失败不影响其他
+          return { f, text: '' };
         }
+      });
+      for (const { f, text } of pulled) {
+        if (!text) continue;
+        const hash = contentHash(text);
+        if (seen.has(hash)) { skipped++; continue; }
+        seen.add(hash);
+        const type = extToType(f.name);
+        const cls = classifyDoc(f.name, text);
+        const doc: Document = {
+          id: uid(), name: f.name, type, folderId: null, tags: ['NAS'],
+          status: 'indexing',
+          meta: { size: f.size, source: 'nas', hash, model: cls.model, kind: cls.kind, category: defCat },
+          createdAt: new Date().toISOString(),
+        };
+        await insertDocument(doc);
+        const chunks = chunkText(text).map((c) => ({ ...c, docId: doc.id }));
+        await insertChunks(chunks);
+        await updateDocStatus(doc.id, 'indexed');
+        added++;
       }
       // 四种结果要说清，尤其「一份都没新增」要区分「NAS 上没有」和「全都有了」——
       // 后者是正常的，说成「未找到可索引的文档」会让人以为同步坏了。
@@ -1054,16 +1187,20 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  // 纯NAS后端：浏览 NAS 文件列表（不落本地）
-  async browseNas() {
+  // 纯NAS后端：浏览 NAS 文件列表（不落本地）。传子目录名 = 进一层；不传 = 回根。
+  async browseNas(subPath) {
     const conn = get().settings.nas;
     if (!conn) { set({ lastError: '尚未配置 NAS 连接。' }); return; }
     if (conn.protocol === 'smb') { set({ lastError: 'SMB 尚未接入，请先在「我的 → NAS 连接」选用 WebDAV。' }); return; }
+    // 路径只在 store 内部拼：调用方（界面）只掌握「点到的那个文件夹名」，
+    // 让它自己拼路径等于把「当前在哪一层」这个状态散到界面上去维护。
+    const next = subPath === undefined ? '' : joinNasPath(get().nasPath, subPath);
     set({ nasScanning: true, lastError: null });
     try {
-      const entries = await listDir(conn, get().nasPassword);
-      set({ nasFiles: entries, nasScanning: false });
+      const entries = await listDir(conn, get().nasPassword, next);
+      set({ nasFiles: entries, nasPath: next, nasScanning: false });
     } catch (e: any) {
+      // 进目录失败时**保留原路径**：列表还是上一层的内容，用户不会卡在一个空屏里
       set({ nasScanning: false, lastError: e?.message || '浏览 NAS 失败' });
     }
   },
